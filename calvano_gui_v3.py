@@ -218,15 +218,22 @@ class QLearningSimulation:
             self._entropy_buffer = None
         self._entropy_buffer_idx = 0
 
-        # 4) Konvergenz-Tracking (Calvano-Konvention: greedy-Politik stabil ueber
-        #    N aufeinanderfolgende Perioden). Wir pruefen alle 1000 Perioden, ob
-        #    die argmax-Aktionen aller Firmen im aktuellen Zustand sich gegenueber
-        #    der letzten Pruefung geaendert haben. Bleibt die greedy-Politik
-        #    convergence_threshold Perioden lang stabil, gilt der Lauf als konvergiert.
+        # 4) Konvergenz-Tracking nach CALVANO-STANDARD (siehe Calvano et al.
+        #    2020, S. 3279 f.): die greedy-Politik gilt als konvergiert, wenn
+        #    sich die argmax-Aktion JEDER Firma in JEDEM Zustand ueber
+        #    convergence_threshold aufeinanderfolgende Perioden NICHT mehr
+        #    aendert.
+        #
+        #    FIX ggu. v3: Frueher wurde nur die greedy-Aktion im aktuell
+        #    besuchten Zustand geprueft. Das triggerte deutlich zu frueh, weil
+        #    Zustaende, die der Lauf gerade nicht besucht, ihre Politik durchaus
+        #    noch aendern koennen. Jetzt vergleichen wir die volle Politik-Matrix
+        #    der Shape (n, n_states). Speicher: n * m^n int64 — fuer n=2, m=15
+        #    sind das 3,6 KB pro Pruefung, also unproblematisch.
         self.convergence_threshold = 100_000
         self._convergence_check_interval = 1000
-        self._last_greedy = None       # zuletzt geprueftes greedy-Tupel
-        self._last_greedy_change_t = 0 # Zeitpunkt der letzten Aenderung
+        self._last_policy: Optional[np.ndarray] = None  # Shape (n, n_states)
+        self._last_policy_change_t = 0  # Zeitpunkt der letzten Politik-Aenderung
 
         self.t = 0
         self.current_state = int(self.rng.integers(0, self.n_states))
@@ -275,12 +282,23 @@ class QLearningSimulation:
         """Zufallsinitialisierung in [0, Q_max].
 
         Q_max ist eine obere Schranke fuer den abdiskontierten Gewinn pro Firma.
-        Wir verwenden den maximal moeglichen Periodengewinn (Monopolfall)
-        geteilt durch (1 - delta). Diese Wahl ist optimistisch, vermeidet aber
-        die exakt symmetrischen Startwerte der best_response-Strategie und
-        bricht so systematische Pfadabhaengigkeiten in der Konvergenz.
+
+        VERBESSERUNG ggu. v3: Frueher wurde max(pi_mono) als obere Schranke
+        verwendet. Das ist aber nur der KOOPERATIVE Periodengewinn — eine
+        Firma kann durch einseitige Abweichung bei hohen Gegnerpreisen
+        kurzfristig MEHR verdienen. Damit Q_max tatsaechlich eine obere
+        Schranke ist, sampeln wir zusaetzlich die Abweichungsgewinne
+        (Gegner spielen p_max, eine Firma variiert ihre Aktion).
         """
-        pi_max = float(np.max(self.pi_mono))
+        pi_candidates = [float(np.max(self.pi_mono))]
+        # Abweichungsgewinn: Gegner spielen p_max, fokale Firma variiert.
+        # Dieses Profil maximiert die einseitige Abweichungsrendite naeherungsweise.
+        for firm in range(self.n):
+            for a in range(self.m):
+                p = np.full(self.n, self.p_max)
+                p[firm] = self.prices[a]
+                pi_candidates.append(float(self.env.profits(p)[firm]))
+        pi_max = max(pi_candidates)
         q_max = pi_max / max(1.0 - self.delta, 1e-9)
         self.Q[:] = self.rng.uniform(0.0, q_max, size=self.Q.shape)
 
@@ -337,30 +355,44 @@ class QLearningSimulation:
         self.current_state = next_state
         self.t += 1
 
-        # ---------- Konvergenzpruefung (alle N Perioden) ----------
-        # Vergleich: hat sich die greedy-Aktion einer Firma im (neuen) aktuellen
-        # Zustand gegenueber der letzten Pruefung veraendert? Wenn ja, setzen
-        # wir den Stabilitaetszaehler zurueck. Wenn nein, akkumuliert er.
+        # ---------- Konvergenzpruefung (alle N Perioden, Calvano-Standard) ----------
+        # Wir berechnen die volle greedy-Politik (Shape (n, n_states)) und
+        # vergleichen sie mit dem zuletzt gespeicherten Snapshot. Hat sich
+        # IRGENDEIN Eintrag geaendert, setzen wir den Stabilitaetszaehler zurueck.
+        # Diese Pruefung ist O(n * m^n) pro Aufruf und wird nur alle 1000 Schritte
+        # gemacht — auch fuer n=3, m=15 (n_states=3375) vernachlaessigbar.
         if self.t % self._convergence_check_interval == 0:
-            greedy = np.array([int(np.argmax(self.Q[i, self.current_state]))
-                                for i in range(self.n)])
-            if self._last_greedy is None or not np.array_equal(greedy, self._last_greedy):
-                self._last_greedy_change_t = self.t
-                self._last_greedy = greedy
+            policy = self._compute_greedy_policy()
+            if self._last_policy is None or not np.array_equal(policy, self._last_policy):
+                self._last_policy_change_t = self.t
+                self._last_policy = policy
 
         return prices, profits, epsilon
 
-    def convergence_status(self):
+    def _compute_greedy_policy(self) -> np.ndarray:
+        """Liefert die aktuelle greedy-Politik als Matrix der Shape (n, n_states).
+
+        policy[i, s] ist die Aktion, die Firma i in Zustand s greedy waehlen
+        wuerde. Ist der zentrale Konvergenz-Indikator nach Calvano.
+        """
+        # np.argmax mit axis=-1 ueber Q-Tabelle gibt direkt die Politik-Matrix.
+        # Q hat Shape (n, n_states, m), also axis=2 -> (n, n_states).
+        return np.argmax(self.Q, axis=2).astype(np.int32)
+
+    def convergence_status(self) -> Tuple[str, int, int]:
         """Liefert ein Tupel (status, periods_stable, threshold) zurueck.
 
+        Misst die Stabilitaet der vollen greedy-Politik nach Calvano-Standard
+        (siehe Kommentar in __init__ und _compute_greedy_policy).
+
         status ist eine der drei Phasen:
-          - 'lernt'         : weniger als 25% des Schwellenwerts ohne Aenderung
-          - 'stabilisiert'  : 25% bis 100% des Schwellenwerts ohne Aenderung
-          - 'konvergiert'   : >= 100% des Schwellenwerts ohne Aenderung
-        periods_stable ist die Anzahl Perioden seit der letzten beobachteten
-        Aenderung der greedy-Politik im aktuellen Zustand.
+          - 'lernt'         : weniger als 25 % des Schwellenwerts ohne Aenderung
+          - 'stabilisiert'  : 25 % bis 100 % des Schwellenwerts ohne Aenderung
+          - 'konvergiert'   : >= 100 % des Schwellenwerts ohne Aenderung
+        periods_stable: Perioden seit der letzten beobachteten Aenderung der
+        greedy-Politik IRGENDEINER Firma in IRGENDEINEM Zustand.
         """
-        periods_stable = self.t - self._last_greedy_change_t
+        periods_stable = self.t - self._last_policy_change_t
         if periods_stable >= self.convergence_threshold:
             status = 'konvergiert'
         elif periods_stable >= self.convergence_threshold // 4:
@@ -368,6 +400,13 @@ class QLearningSimulation:
         else:
             status = 'lernt'
         return status, periods_stable, self.convergence_threshold
+
+    def is_converged(self) -> bool:
+        """Kurzform: ist die volle greedy-Politik seit `convergence_threshold`
+        Perioden unveraendert? Wird vom Batch-Worker und der GUI verwendet,
+        damit beide Seiten dieselbe Konvergenz-Definition benutzen.
+        """
+        return self.convergence_status()[0] == 'konvergiert'
 
     def collusion_index(self, profits):
         """Delta = (pi_avg - pi_Nash) / (pi_Mono - pi_Nash)."""
@@ -519,34 +558,26 @@ def _run_single_replication(args) -> RunResult:
         )
         report("started", episodes=cfg.episodes)
 
-        # Konvergenz-Tracking
-        convergence_window = max(10000, cfg.episodes // 10)
-        last_change = 0
-        prev_greedy = np.array([np.argmax(sim.Q[i, sim.current_state])
-                                 for i in range(cfg.n)])
-
-        # Aufzeichnung der letzten avg_window Werte
+        # Aufzeichnung der letzten avg_window Werte fuer das finale Delta-Mittel
         avg_w = min(cfg.avg_window, cfg.episodes)
         recent_profits = np.zeros((avg_w, cfg.n))
         recent_prices = np.zeros((avg_w, cfg.n))
         recent_deltas = np.zeros(avg_w)
 
-        # Progress-Reporting: ca. 100 Updates pro Lauf, mind. alle 50k
+        # Progress-Reporting: ca. 100 Updates pro Lauf, mind. alle 50k.
         progress_interval = max(50000, cfg.episodes // 100)
 
+        # FIX ggu. v3: keine eigene Konvergenzlogik mehr im Worker. Die Pruefung
+        # uebernimmt jetzt QLearningSimulation.is_converged() (Stabilitaet der
+        # vollen greedy-Politik ueber convergence_threshold Perioden, nach
+        # Calvano-Standard). Damit berichten Single-Run und Batch dieselbe
+        # Konvergenzmetrik.
         for t in range(cfg.episodes):
             prices, profits, eps = sim.step()
             idx = t % avg_w
             recent_prices[idx] = prices
             recent_profits[idx] = profits
             recent_deltas[idx] = sim.collusion_index(profits)
-
-            if t % 1000 == 0:
-                greedy = np.array([np.argmax(sim.Q[i, sim.current_state])
-                                   for i in range(cfg.n)])
-                if not np.array_equal(greedy, prev_greedy):
-                    last_change = t
-                    prev_greedy = greedy
 
             # Progress-Update an Queue
             if t > 0 and t % progress_interval == 0:
@@ -556,7 +587,7 @@ def _run_single_replication(args) -> RunResult:
                                   else recent_deltas.mean())
                 report("progress", t=t, eps=float(eps), delta=cur_delta)
 
-        converged = (cfg.episodes - last_change) >= convergence_window
+        converged = sim.is_converged()
 
         # Visits-Heatmap nur kopieren, wenn explizit angefordert: spart bei
         # grossen Konfigurationen viel Speicher und Inter-Prozess-Kommunikation.
@@ -989,11 +1020,10 @@ class CalvanoGUI:
             state="readonly", width=14,
         ).grid(row=9, column=1, sticky=tk.W, padx=4)
 
-        # Hilfsbutton: Iterationen anhand der Q-Tabellengroesse vorschlagen
-        # (siehe Ideen.docx 1.4 \u2014 gleicher Erwartungswert an Updates pro Eintrag,
-        # damit Replikationen ueber verschiedene n vergleichbar sind).
+        # Hilfsbutton: Iterationen anhand der Q-Tabellengroesse UND \u03b2 vorschlagen
+        # (FIX v3 \u2014 siehe _suggest_episodes-Docstring fuer Details).
         ttk.Button(
-            params_frame, text="Iterationen vorschlagen (\u22483 \u00d7 m^n)",
+            params_frame, text="Iterationen vorschlagen (\u03b2- und m^n-basiert)",
             command=self._suggest_episodes,
         ).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
 
@@ -1137,13 +1167,30 @@ class CalvanoGUI:
             self._print(f"Unbekannter Befehl: {parts[0]}")
 
     # ---- Simulation ----
+    @staticmethod
+    def _safe_get(var: tk.Variable, label: str, caster=float):
+        """Robustes Lesen von Tk-Variablen.
+
+        FIX ggu. v3: Frueher loeste ein leeres Entry-Feld einen rohen
+        tk.TclError mit unverstaendlicher Nachricht aus. Jetzt fangen wir
+        TclError und ValueError ab und werfen einen sprechenden ValueError,
+        den der Aufrufer in einem messagebox anzeigen kann.
+        """
+        try:
+            return caster(var.get())
+        except (tk.TclError, ValueError) as e:
+            raise ValueError(
+                f"Ungueltiger Wert fuer '{label}': leer oder kein "
+                f"{'Integer' if caster is int else 'Float'}.") from e
+
     def _collect_params(self):
-        n = int(self.n_firms_var.get())
+        # Alle Felder einzeln einlesen, damit Fehlerquellen sprechend benannt werden.
+        n = self._safe_get(self.n_firms_var, "Anzahl Firmen n", int)
         if not (2 <= n <= self.MAX_FIRMS):
             raise ValueError(f"n muss in [2, {self.MAX_FIRMS}] liegen.")
-        a = [float(self.a_vars[i].get()) for i in range(n)]
-        c = [float(self.c_vars[i].get()) for i in range(n)]
-        m = int(self.m_var.get())
+        a = [self._safe_get(self.a_vars[i], f"a_{i+1}", float) for i in range(n)]
+        c = [self._safe_get(self.c_vars[i], f"c_{i+1}", float) for i in range(n)]
+        m = self._safe_get(self.m_var, "Preispunkte m", int)
         if m < 2:
             raise ValueError("m muss mindestens 2 sein.")
         # Speicherwarnung
@@ -1157,40 +1204,50 @@ class CalvanoGUI:
                 raise RuntimeError("Abgebrochen durch Nutzer.")
         return dict(
             n=n, m=m,
-            alpha=float(self.alpha_var.get()),
-            beta=float(self.beta_var.get()),
-            delta=float(self.delta_var.get()),
-            mu=float(self.mu_var.get()),
-            a0=float(self.a0_var.get()),
-            xi=float(self.xi_var.get()),
+            alpha=self._safe_get(self.alpha_var, "Lernrate α", float),
+            beta=self._safe_get(self.beta_var, "Explorationsrate β", float),
+            delta=self._safe_get(self.delta_var, "Diskontfaktor δ", float),
+            mu=self._safe_get(self.mu_var, "Differenzierung μ", float),
+            a0=self._safe_get(self.a0_var, "Outside Option a₀", float),
+            xi=self._safe_get(self.xi_var, "Preisspanne ξ", float),
             a=a, c=c,
-            episodes=int(self.episodes_var.get()),
+            episodes=self._safe_get(self.episodes_var, "Iterationen", int),
             init_strategy=str(self.init_strategy_var.get()),
         )
 
     def _suggest_episodes(self):
-        """Setzt das Iterationsfeld auf einen Vorschlagswert (3 · m^n).
+        """Setzt das Iterationsfeld auf einen oekonomisch motivierten Vorschlagswert.
 
-        Hintergrund (siehe Ideen.docx, Abschnitt 1.4): Damit jeder Q-Eintrag im
-        Erwartungswert die gleiche Anzahl Updates erhaelt, sollten die Iterationen
-        proportional zur Q-Tabellengroesse m^n skaliert werden. Mit dem Faktor 3
-        erhaelt jeder Eintrag im Mittel rund 3 Updates aus der Exploitation-Phase,
-        was fuer eine stabile Q-Schaetzung in Calvanos Baseline empirisch ausreicht.
-        Bei sehr kleinem m^n setzen wir mindestens 200000, damit auch das Duopol
-        eine sinnvolle Konvergenz erreicht.
+        FIX ggu. v3: Frueher war der Vorschlag nur 3 · m^n. Das ignoriert β:
+        bei β = 4e-6 ist ε(t) = exp(-β · t) bei t = 500 000 noch ca. 0,135,
+        d. h. 13 % zufaellige Aktionen — die greedy-Politik kann gar nicht
+        konvergieren. Calvano laesst die Laeufe so lange laufen, bis ε so
+        klein ist, dass die Exploration vernachlaessigbar wird (typisch
+        ε_final ≈ 0,005 entspricht t ≈ 5,3 / β).
+
+        Wir nehmen das Maximum aus:
+          (a) der β-Schranke 5 / β (ε_final ≈ 0,007)  — fuer Exploration-Abklingen,
+          (b) 3 · m^n                                  — fuer State-Coverage,
+          (c) 200 000                                  — Mindestwert fuer Duopol.
         """
         try:
             m = int(self.m_var.get())
             n = int(self.n_firms_var.get())
+            beta = float(self.beta_var.get())
         except (tk.TclError, ValueError):
             messagebox.showinfo(
-                "Hinweis", "Bitte zuerst gueltiges n und m eingeben.")
+                "Hinweis", "Bitte zuerst gueltiges n, m und β eingeben.")
             return
-        suggestion = max(200_000, 3 * (m ** n))
+        # Schranke (a): exp(-β · T) = 0,007  ⇒  T = -ln(0,007) / β ≈ 4,96 / β
+        beta_bound = int(5.0 / beta) if beta > 0 else 0
+        coverage_bound = 3 * (m ** n)
+        suggestion = max(200_000, beta_bound, coverage_bound)
         self.episodes_var.set(suggestion)
         self._print(
-            f"Vorschlag: {suggestion:,} Iterationen (= max(200k, 3 · m^n) "
-            f"mit m={m}, n={n}).")
+            f"Vorschlag: {suggestion:,} Iterationen.\n"
+            f"  β-Schranke (5/β):    {beta_bound:>12,}  → ε_final ≈ 0,007\n"
+            f"  Coverage (3·m^n):    {coverage_bound:>12,}  (m={m}, n={n})\n"
+            f"  Mindest-Iterationen: {200_000:>12,}")
 
     def start_simulation(self):
         if self.running:
@@ -1225,6 +1282,15 @@ class CalvanoGUI:
             self.history_explore_share = []
             # Konvergenz-Alert-Flag fuer diesen Lauf zuruecksetzen
             self._alerted_converged = False
+            # FIX ggu. v3: Ringpuffer der letzten avg_w Delta-Werte fuer das
+            # finale Mittel. Vorher wurde nur der letzte Step-Wert als
+            # "Finaler Kollusionsindex" gedruckt — der schwankt aber durch
+            # die einzelne Aktionswahl stark. Jetzt nutzt der Single-Run
+            # dieselbe Mittelung wie der Batch (avg_w = 1000 by default).
+            self._final_delta_window = min(1000, p["episodes"])
+            self._recent_deltas = np.zeros(self._final_delta_window)
+            self._recent_deltas_idx = 0
+            self._recent_deltas_filled = 0
 
             self.running = True
             self.start_btn.config(state=tk.DISABLED)
@@ -1253,6 +1319,10 @@ class CalvanoGUI:
         self.history_delta = []
         self.history_epsilon = []
         self.history_explore_share = []
+        # Ringpuffer fuer das finale Delta-Mittel (FIX v3) zuruecksetzen
+        self._recent_deltas = None
+        self._recent_deltas_idx = 0
+        self._recent_deltas_filled = 0
         for ax in (self.ax_price, self.ax_profit, self.ax_delta):
             ax.clear()
         self.canvas.draw()
@@ -1275,13 +1345,22 @@ class CalvanoGUI:
             while self.running and sim.t < target:
                 prices, profits, eps = sim.step()
 
+                # Ringpuffer fuer das finale Delta-Mittel pflegen (jeden Step).
+                # Das ist billig (eine Schreiboperation) und liefert am Ende
+                # einen stabilen Mittelwert ueber die letzten ~1000 Iterationen.
+                delta_now = sim.collusion_index(profits)
+                self._recent_deltas[self._recent_deltas_idx] = delta_now
+                self._recent_deltas_idx = (
+                    (self._recent_deltas_idx + 1) % self._final_delta_window)
+                if self._recent_deltas_filled < self._final_delta_window:
+                    self._recent_deltas_filled += 1
+
                 if sim.t % log_interval == 0 or sim.t == target:
-                    delta_val = sim.collusion_index(profits)
                     self.history_t.append(sim.t)
                     for i in range(n):
                         self.history_prices[i].append(float(prices[i]))
                         self.history_profits[i].append(float(profits[i]))
-                    self.history_delta.append(delta_val)
+                    self.history_delta.append(delta_now)
                     # epsilon und kumulativer Explorationsanteil mitloggen
                     # (siehe Ideen.docx 1.3, fuer Phasenvisualisierung).
                     self.history_epsilon.append(float(eps))
@@ -1318,10 +1397,18 @@ class CalvanoGUI:
                 else f"Training gestoppt bei {sim.t:,} Iterationen."
             )
             self.root.after(0, lambda m=msg: self._print(m))
-            if self.history_delta:
-                final_delta = self.history_delta[-1]
-                self.root.after(0, lambda d=final_delta:
-                                self._print(f"Finaler Kollusionsindex: Delta = {d:.4f}"))
+            # FIX ggu. v3: Mittel ueber die letzten _final_delta_window Schritte
+            # statt einzelnem Endwert. Damit ist der Wert in derselben Skala
+            # wie das Batch-final_delta und unabhaengig von der zufaelligen
+            # letzten Aktion.
+            if self._recent_deltas_filled > 0:
+                final_delta = float(
+                    self._recent_deltas[:self._recent_deltas_filled].mean())
+                window_used = self._recent_deltas_filled
+                self.root.after(0, lambda d=final_delta, w=window_used:
+                                self._print(
+                                    f"Finaler Kollusionsindex: "
+                                    f"Delta = {d:.4f} (Mittel der letzten {w} Iterationen)"))
             self.running = False
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
@@ -1648,15 +1735,23 @@ class CalvanoGUI:
         for i in range(sim.n):
             arr = self.history_prices[i][-win_size:] if win_size > 0 else []
             final_prices.append(float(np.mean(arr)) if arr else float("nan"))
+        # FIX ggu. v3: final_delta auch hier aus dem Ringpuffer-Mittel,
+        # nicht aus dem letzten Schritt. Konsistent mit Batch und Konsolenausgabe.
+        if (getattr(self, "_recent_deltas", None) is not None
+                and self._recent_deltas_filled > 0):
+            fd = float(self._recent_deltas[:self._recent_deltas_filled].mean())
+        elif self.history_delta:
+            fd = float(self.history_delta[-1])
+        else:
+            fd = float("nan")
         rr = RunResult(
             seed=self.seed,
             final_prices=final_prices,
             final_profits=[],
-            final_delta=float(self.history_delta[-1])
-                          if self.history_delta else float("nan"),
+            final_delta=fd,
             p_nash=sim.p_nash.tolist(),
             p_mono=sim.p_mono.tolist(),
-            converged=False, elapsed_s=0.0,
+            converged=sim.is_converged(), elapsed_s=0.0,
             q_table=sim.Q.copy(),
             action_prices=sim.prices.copy(),
             explore_count=int(sim.explore_count),
@@ -2666,5 +2761,97 @@ def main():
     root.mainloop()
 
 
+# ==========================================================
+# SANITY-TESTS (Aufruf ueber:  python calvano_gui_v3.py --selftest )
+# ==========================================================
+#
+# Diese kleinen Tests laufen ohne GUI und pruefen, ob das oekonomische Modell
+# auf die im Paper veroeffentlichten Referenzwerte trifft. Sie sind bewusst
+# minimal gehalten — wer eine vollwertige Test-Suite will, sollte den Code
+# in ein eigenes pytest-File auslagern.
+
+def _selftest_calvano_baseline() -> None:
+    """Reproduziert die Standard-Symmetrie von Calvano et al. 2020.
+
+    Parameter: n=2, m=15, μ=0.25, a=2, c=1, a0=0 (Tabelle 1 im Paper).
+    Erwartung (aus dem Paper):
+        p_Nash ≈ 1.4729
+        p_Mono ≈ 1.9249
+    Wir akzeptieren eine Toleranz von 1e-3.
+    """
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
+    p_n = env.nash_prices()
+    p_m = env.monopoly_prices()
+    print(f"[selftest] Nash-Preise:    {p_n}")
+    print(f"[selftest] Monopol-Preise: {p_m}")
+    assert np.allclose(p_n, [1.4729, 1.4729], atol=1e-3), \
+        f"Nash weicht ab: erwartet ~1.4729, bekommen {p_n}"
+    assert np.allclose(p_m, [1.9249, 1.9249], atol=1e-3), \
+        f"Monopol weicht ab: erwartet ~1.9249, bekommen {p_m}"
+    # Profite bei Nash und Monopol — Monopol muss strikt besser sein.
+    pi_n = env.profits(p_n)
+    pi_m = env.profits(p_m)
+    assert (pi_m > pi_n).all(), \
+        f"Monopol-Profite muessen ueber Nash-Profiten liegen: pi_n={pi_n}, pi_m={pi_m}"
+    print("[selftest] Calvano-Baseline OK.")
+
+
+def _selftest_convergence_policy() -> None:
+    """Pruft, dass _compute_greedy_policy stabil das richtige Argmax liefert."""
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
+    rng = np.random.default_rng(0)
+    sim = QLearningSimulation(
+        env=env, m=5, alpha=0.15, beta=4e-6, delta=0.95, xi=0.1, rng=rng,
+        init_strategy="zeros",
+    )
+    # Setze willkuerlich eine eindeutige beste Aktion pro (Firma, Zustand).
+    # Erwartung: _compute_greedy_policy spiegelt diese argmax-Wahl wider.
+    sim.Q[:] = 0.0
+    sim.Q[0, 3, 2] = 10.0  # Firma 0, State 3: argmax = 2
+    sim.Q[1, 7, 4] = 10.0  # Firma 1, State 7: argmax = 4
+    policy = sim._compute_greedy_policy()
+    assert policy.shape == (2, sim.n_states), \
+        f"policy hat falsche Form: {policy.shape}"
+    assert policy[0, 3] == 2 and policy[1, 7] == 4, \
+        f"argmax-Logik bricht: policy[0,3]={policy[0,3]}, policy[1,7]={policy[1,7]}"
+    # Konvergenzstatus muss initial 'lernt' sein, da t=0.
+    status, stable, thr = sim.convergence_status()
+    assert status == 'lernt' and stable == 0, \
+        f"Erwartet 'lernt' bei t=0, bekommen {status}, stable={stable}"
+    print("[selftest] Konvergenzlogik OK.")
+
+
+def _selftest_run() -> None:
+    """Ein Mini-Lauf, damit step()/Q-Update auch wirklich durchlaeuft."""
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
+    rng = np.random.default_rng(42)
+    sim = QLearningSimulation(
+        env=env, m=5, alpha=0.15, beta=1e-4, delta=0.95, xi=0.1, rng=rng,
+        init_strategy="best_response", track_entropy=True, entropy_window=50,
+    )
+    for _ in range(500):
+        sim.step()
+    # Visits muessen sich aufaddieren — mindestens t * 0 koennen nicht alle bleiben.
+    assert sim.visits.sum() == 500 * sim.n, \
+        f"Visits-Summe stimmt nicht: {sim.visits.sum()} vs erwartet {500*sim.n}"
+    # Aktionsentropie muss ein endlicher Vektor sein.
+    H = sim.action_entropy()
+    assert H.shape == (2,) and np.all(np.isfinite(H)), \
+        f"Entropie kaputt: {H}"
+    print(f"[selftest] Mini-Run OK ({sim.t} Schritte, H={H}).")
+
+
+def _run_selftests() -> None:
+    print("=== Calvano-Sanity-Tests ===")
+    _selftest_calvano_baseline()
+    _selftest_convergence_policy()
+    _selftest_run()
+    print("=== Alle Tests bestanden. ===")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--selftest" in sys.argv:
+        _run_selftests()
+    else:
+        main()
