@@ -126,10 +126,28 @@ class CalvanoEnvironment:
         pi_nash_sum = -neg_joint_profit(p_nash)
 
         # Schranken: oberhalb der Grenzkosten, mit grosszuegigem Oberwert.
-        # 30·μ ist konservativ — bei reiner Logit-Nachfrage verschwindet
-        # die Nachfrage darueber praktisch vollstaendig.
+        #
+        # KRITISCHER FIX (kleines μ): frueher war upper = c + 30·μ. Diese
+        # Wahl ist bei großem μ (z. B. 0.25 oder 0.5) ausreichend, bei
+        # kleinem μ aber viel zu eng: das Monopol-Optimum liegt dann nahe
+        # der Qualitaet a (nicht nahe c), und der Optimierer findet bloss
+        # einen Randwert.
+        #
+        # Beispiel μ=0.01, a=2, c=1: wahre p_M ≈ 1.96 mit joint π ≈ 0.95.
+        # Mit der alten Schranke upper=1.30 lieferte die Suche p_M=1.30 mit
+        # joint π=0.30 → spaeter Δ deutlich > 1 in den Simulationen.
+        #
+        # Theoretische Argumentation: bei Logit-Nachfrage verschwindet die
+        # eigene Nachfrage exponentiell, sobald exp((a_i - p_i)/μ) klein
+        # ist gegen exp(a_0/μ), also p_i > a_i - a_0 + (ein paar μ). Wir
+        # nehmen daher pro Firma:
+        #   upper_i = max(a_i, c_i) - a_0 + 30·μ
+        # Das deckt sowohl den Niedrig-μ-Fall (Optimum nahe a) als auch
+        # den Hoch-μ-Fall (Optimum nahe c + viele μ) ab.
         lower = self.c + 1e-4
-        upper = self.c + 30.0 * self.mu
+        upper = np.maximum(self.a, self.c) - self.a0 + 30.0 * self.mu
+        # Schutz vor entarteten Faellen (mu sehr klein, a0 sehr groß):
+        upper = np.maximum(upper, lower + 1e-3)
 
         # ----- Fall 1: Symmetrischer Markt → 1D-Brent ----------------------
         # Die Symmetrie der Zielfunktion garantiert, dass das Optimum auf
@@ -143,7 +161,11 @@ class CalvanoEnvironment:
             def neg_sym(p_scalar):
                 return -float(np.sum(self.profits(np.full(self.n, p_scalar))))
 
-            lo, hi = c0 + 1e-4, c0 + 30.0 * self.mu
+            # Gleiche Schranken-Logik wie im asymmetrischen Fall (siehe oben).
+            a0_scalar = float(self.a[0])
+            lo = c0 + 1e-4
+            hi = max(a0_scalar, c0) - self.a0 + 30.0 * self.mu
+            hi = max(hi, lo + 1e-3)
             res = minimize_scalar(
                 neg_sym, bounds=(lo, hi), method="bounded",
                 options={"xatol": 1e-12},
@@ -857,6 +879,25 @@ def aggregate_results(results: List[RunResult]) -> dict:
         n_converged=sum(1 for r in ok if r.converged),
         deltas=deltas.tolist(),
     )
+
+
+def aggregate_results_split(results: List[RunResult]) -> dict:
+    """Aggregation getrennt nach Konvergenzstatus.
+
+    Liefert ein Dictionary mit drei Eintraegen 'all', 'converged',
+    'not_converged'; jeder Wert ist eine aggregate_results-Statistik fuer
+    die jeweilige Teilmenge. So koennen Δ-Verteilungen verglichen werden:
+    'Sind die Δ konvergierter Laufe systematisch hoeher als die der
+    nicht konvergierten?' — typische Frage in der BA-Auswertung.
+    """
+    ok = [r for r in results if not r.error]
+    conv = [r for r in ok if r.converged]
+    nonconv = [r for r in ok if not r.converged]
+    return {
+        "all": aggregate_results(results),
+        "converged": aggregate_results(conv),
+        "not_converged": aggregate_results(nonconv),
+    }
 
 
 def estimate_q_tables_size_bytes(cfg: BatchConfig) -> int:
@@ -2132,6 +2173,29 @@ class BatchWindow:
         # ---- Ergebnisse: Zusammenfassung + Plots ----
         summary_frame = ttk.LabelFrame(right, text="Zusammenfassung", padding=8)
         summary_frame.pack(fill=tk.X, pady=4)
+
+        # Filter-Combobox fuer Konvergenz-Status. Ermoeglicht den Vergleich
+        # 'Δ konvergierter Laeufe vs. nicht konvergierter Laeufe', der fuer
+        # die BA-Auswertung wichtig ist (Hypothese: konvergierte Laeufe
+        # erreichen systematisch höhere Δ-Werte).
+        filter_frame = ttk.Frame(summary_frame)
+        filter_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(filter_frame, text="Anzeige:").pack(side=tk.LEFT)
+        self.filter_var = tk.StringVar(value="alle")
+        filter_combo = ttk.Combobox(
+            filter_frame, textvariable=self.filter_var, state="readonly",
+            width=24,
+            values=[
+                "alle",
+                "nur konvergiert",
+                "nur nicht konvergiert",
+                "Vergleich konv. vs. nicht",
+            ],
+        )
+        filter_combo.pack(side=tk.LEFT, padx=(4, 0))
+        filter_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_filter_changed())
+
         self.summary_label = ttk.Label(
             summary_frame, text="(noch keine Ergebnisse)",
             font=("Courier", 10), justify=tk.LEFT,
@@ -2396,30 +2460,90 @@ class BatchWindow:
     def _set_status(self, msg: str):
         self.status_label.config(text=msg)
 
+    def _on_filter_changed(self):
+        """Callback fuer die Filter-Combobox: neu rendern."""
+        self._refresh_summary()
+        self._refresh_plots()
+
+    @staticmethod
+    def _format_block(label: str, agg: dict) -> str:
+        """Formatiert einen einzelnen Aggregations-Block fuer die Anzeige.
+
+        Wird sowohl fuer den 'all'-Fall als auch fuer 'converged' /
+        'not_converged' verwendet. Gibt eine kompakte 5-Zeilen-Statistik
+        in Monospace-Format zurueck.
+        """
+        if agg["n_runs"] == 0:
+            return f"{label}: (keine Laeufe)"
+        return (
+            f"{label} (n = {agg['n_runs']}):\n"
+            f"  Δ Mittel    : {agg['mean_delta']:+.4f}\n"
+            f"  Δ Std       : {agg['std_delta']:.4f}\n"
+            f"  Δ Median    : {agg['median_delta']:+.4f}\n"
+            f"  Δ Min / Max : {agg['min_delta']:+.4f} / {agg['max_delta']:+.4f}"
+        )
+
     def _refresh_summary(self):
+        """Aktualisiert die Zusammenfassung gemaess Filter-Auswahl.
+
+        Optionen:
+          'alle'                  → klassische Gesamtstatistik
+          'nur konvergiert'       → nur die Teilmenge converged=True
+          'nur nicht konvergiert' → nur die Teilmenge converged=False
+          'Vergleich ...'         → beide Teilmengen nebeneinander samt
+                                   Mittelwertdifferenz Δ_konv − Δ_nicht
+        """
         if not self.results:
             self.summary_label.config(text="(noch keine Ergebnisse)")
             return
-        agg = aggregate_results(self.results)
-        if agg["n_runs"] == 0:
+        split = aggregate_results_split(self.results)
+        all_agg = split["all"]
+        if all_agg["n_runs"] == 0:
             self.summary_label.config(
-                text=f"Alle {agg['n_failed']} Laeufe fehlgeschlagen."
-            )
+                text=f"Alle {all_agg['n_failed']} Laeufe fehlgeschlagen.")
             return
-        txt = (
-            f"Erfolgreiche Laeufe: {agg['n_runs']}"
-            + (f" (von denen {agg['n_failed']} fehlgeschlagen)"
-               if agg['n_failed'] else "")
-            + f"\nKonvergiert:         {agg['n_converged']}/{agg['n_runs']}\n"
-            f"Δ Mittelwert:        {agg['mean_delta']:+.4f}\n"
-            f"Δ Standardabw.:      {agg['std_delta']:.4f}\n"
-            f"Δ Median:            {agg['median_delta']:+.4f}\n"
-            f"Δ Min / Max:         {agg['min_delta']:+.4f}  /  "
-            f"{agg['max_delta']:+.4f}"
-        )
+
+        mode = self.filter_var.get()
+        header = (
+            f"Erfolgreiche Laeufe : {all_agg['n_runs']}"
+            f"   (Fehler: {all_agg['n_failed']})\n"
+            f"Konvergiert         : "
+            f"{all_agg['n_converged']}/{all_agg['n_runs']}\n")
+
+        if mode == "nur konvergiert":
+            txt = header + "\n" + self._format_block("Konvergierte Laeufe",
+                                                      split["converged"])
+        elif mode == "nur nicht konvergiert":
+            txt = header + "\n" + self._format_block(
+                "Nicht konvergierte Laeufe", split["not_converged"])
+        elif mode.startswith("Vergleich"):
+            # Mittelwertdifferenz als zentraler Befund fuer die BA: ist die
+            # Konvergenz mit höherem Δ assoziiert?
+            c, nc = split["converged"], split["not_converged"]
+            diff_line = ""
+            if c["n_runs"] > 0 and nc["n_runs"] > 0:
+                diff = c["mean_delta"] - nc["mean_delta"]
+                diff_line = (
+                    f"\nMittelwertdifferenz Δ_konv − Δ_nicht : "
+                    f"{diff:+.4f}")
+            txt = (
+                header + "\n"
+                + self._format_block("Konvergiert", c) + "\n\n"
+                + self._format_block("Nicht konvergiert", nc)
+                + diff_line)
+        else:  # 'alle'
+            txt = header + "\n" + self._format_block("Alle Laeufe", all_agg)
         self.summary_label.config(text=txt)
 
     def _refresh_plots(self):
+        """Histogramm + Seed-Scatter, abhaengig von Filter-Auswahl.
+
+        - 'alle'              : ein Histogramm ueber alle Δ
+        - 'nur konvergiert'   : ein Histogramm nur ueber converged-Laeufe
+        - 'nur nicht konv.'   : ein Histogramm nur ueber non-converged
+        - 'Vergleich ...'     : zwei ueberlagerte Histogramme (gruen/rot)
+                                mit zwei Mittelwert-Linien
+        """
         ok = [r for r in self.results if not r.error]
         self.ax_hist.clear()
         self.ax_seeds.clear()
@@ -2428,25 +2552,28 @@ class BatchWindow:
             self.canvas.draw_idle()
             return
 
-        deltas = np.array([r.final_delta for r in ok])
-        n_bins = min(20, max(5, len(deltas) // 2))
-        self.ax_hist.hist(deltas, bins=n_bins, color="steelblue",
-                          edgecolor="white", alpha=0.85)
-        self.ax_hist.axvline(0, color="red", linestyle="--", alpha=0.6,
-                              label="Nash (Δ = 0)")
-        self.ax_hist.axvline(1, color="green", linestyle="--", alpha=0.6,
-                              label="Monopol (Δ = 1)")
-        self.ax_hist.axvline(deltas.mean(), color="black", linewidth=2,
-                              label=f"Mittel = {deltas.mean():+.3f}")
-        self.ax_hist.set_xlabel("Kollusionsindex Δ (Mittelwert ueber "
-                                 "Endphase)")
-        self.ax_hist.set_ylabel("Anzahl Replikationen")
-        self.ax_hist.set_title(
-            f"Verteilung von Δ ueber {len(deltas)} Replikationen"
-        )
-        self.ax_hist.legend(fontsize=7, loc="best")
-        self.ax_hist.grid(True, alpha=0.3)
+        deltas_all = np.array([r.final_delta for r in ok])
+        conv_flags = np.array([r.converged for r in ok])
+        deltas_c = deltas_all[conv_flags]
+        deltas_n = deltas_all[~conv_flags]
 
+        mode = self.filter_var.get()
+
+        # ---------------- Histogramm ----------------
+        if mode == "nur konvergiert":
+            subset, color, label = deltas_c, "seagreen", "konvergiert"
+            self._plot_single_hist(subset, color, label)
+        elif mode == "nur nicht konvergiert":
+            subset, color, label = deltas_n, "indianred", "nicht konvergiert"
+            self._plot_single_hist(subset, color, label)
+        elif mode.startswith("Vergleich"):
+            self._plot_compare_hist(deltas_c, deltas_n)
+        else:
+            self._plot_single_hist(deltas_all, "steelblue", "alle")
+
+        # ---------------- Seed-Scatter ----------------
+        # Im Scatter-Plot zeigen wir IMMER alle Punkte (gruen/rot codiert),
+        # damit die Unterscheidung visuell direkt erkennbar bleibt.
         ok_sorted = sorted(ok, key=lambda r: r.seed)
         seeds = [r.seed for r in ok_sorted]
         ds = [r.final_delta for r in ok_sorted]
@@ -2456,7 +2583,8 @@ class BatchWindow:
                                linewidth=0.5)
         self.ax_seeds.axhline(0, color="red", linestyle="--", alpha=0.5)
         self.ax_seeds.axhline(1, color="green", linestyle="--", alpha=0.5)
-        self.ax_seeds.axhline(deltas.mean(), color="black", alpha=0.5)
+        if len(deltas_all) > 0:
+            self.ax_seeds.axhline(deltas_all.mean(), color="black", alpha=0.5)
         self.ax_seeds.set_xlabel("Seed")
         self.ax_seeds.set_ylabel("Δ")
         self.ax_seeds.set_title("Δ pro Seed (gruen: konvergiert, "
@@ -2465,6 +2593,65 @@ class BatchWindow:
 
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+    def _plot_single_hist(self, deltas: np.ndarray, color: str, label: str):
+        """Zeichnet ein Histogramm fuer eine Teilmenge der Δ-Werte."""
+        if len(deltas) == 0:
+            self.ax_hist.text(
+                0.5, 0.5, f"(keine Laeufe in Kategorie '{label}')",
+                ha="center", va="center", transform=self.ax_hist.transAxes)
+            return
+        n_bins = min(20, max(5, len(deltas) // 2))
+        self.ax_hist.hist(deltas, bins=n_bins, color=color,
+                          edgecolor="white", alpha=0.85, label=label)
+        self.ax_hist.axvline(0, color="red", linestyle="--", alpha=0.6,
+                              label="Nash (Δ = 0)")
+        self.ax_hist.axvline(1, color="green", linestyle="--", alpha=0.6,
+                              label="Monopol (Δ = 1)")
+        self.ax_hist.axvline(deltas.mean(), color="black", linewidth=2,
+                              label=f"Mittel = {deltas.mean():+.3f}")
+        self.ax_hist.set_xlabel("Kollusionsindex Δ")
+        self.ax_hist.set_ylabel("Anzahl Replikationen")
+        self.ax_hist.set_title(f"Verteilung von Δ — {label} (n = {len(deltas)})")
+        self.ax_hist.legend(fontsize=7, loc="best")
+        self.ax_hist.grid(True, alpha=0.3)
+
+    def _plot_compare_hist(self, deltas_c: np.ndarray, deltas_n: np.ndarray):
+        """Vergleichshistogramm konvergiert vs. nicht konvergiert.
+
+        Beide Verteilungen werden mit gemeinsamen Bin-Grenzen geplottet
+        (so sind die Saeulen direkt vergleichbar) und transparent
+        ueberlagert. Vertikale Linien markieren die jeweiligen Mittelwerte.
+        """
+        if len(deltas_c) == 0 and len(deltas_n) == 0:
+            return
+        # Gemeinsame Bin-Grenzen, damit die zwei Verteilungen vergleichbar sind
+        combined = np.concatenate([deltas_c, deltas_n])
+        n_bins = min(20, max(5, len(combined) // 2))
+        bins = np.linspace(combined.min(), combined.max(), n_bins + 1) \
+               if combined.min() != combined.max() else n_bins
+
+        if len(deltas_c) > 0:
+            self.ax_hist.hist(deltas_c, bins=bins, color="seagreen",
+                              edgecolor="white", alpha=0.55,
+                              label=f"konvergiert (n={len(deltas_c)}, "
+                                    f"⌀={deltas_c.mean():+.3f})")
+            self.ax_hist.axvline(deltas_c.mean(), color="seagreen",
+                                  linewidth=2, linestyle="-")
+        if len(deltas_n) > 0:
+            self.ax_hist.hist(deltas_n, bins=bins, color="indianred",
+                              edgecolor="white", alpha=0.55,
+                              label=f"nicht konvergiert (n={len(deltas_n)}, "
+                                    f"⌀={deltas_n.mean():+.3f})")
+            self.ax_hist.axvline(deltas_n.mean(), color="indianred",
+                                  linewidth=2, linestyle="-")
+        self.ax_hist.axvline(0, color="red", linestyle="--", alpha=0.4)
+        self.ax_hist.axvline(1, color="green", linestyle="--", alpha=0.4)
+        self.ax_hist.set_xlabel("Kollusionsindex Δ")
+        self.ax_hist.set_ylabel("Anzahl Replikationen")
+        self.ax_hist.set_title("Δ-Verteilung: konvergiert vs. nicht konvergiert")
+        self.ax_hist.legend(fontsize=7, loc="best")
+        self.ax_hist.grid(True, alpha=0.3)
 
     def export_csv(self):
         if not self.results or not self.runner:
@@ -2485,12 +2672,38 @@ class BatchWindow:
             messagebox.showerror("Export-Fehler", str(e))
             return
 
+        # Zusatz-Export: Getrennte CSV-Dateien fuer konvergierte und nicht
+        # konvergierte Laeufe — fuer die Vergleichsauswertung in der BA.
+        # Dateinamen: <base>_converged.csv und <base>_not_converged.csv.
+        # Werden uebersprungen, falls eine der Gruppen leer ist.
+        try:
+            ok = [r for r in self.results if not r.error]
+            conv = [r for r in ok if r.converged]
+            nonconv = [r for r in ok if not r.converged]
+            base = os.path.splitext(path)[0]
+            split_paths = []
+            if conv:
+                path_c = base + "_converged.csv"
+                export_results_csv(self.runner.cfg, conv, path_c)
+                split_paths.append((path_c, len(conv)))
+            if nonconv:
+                path_n = base + "_not_converged.csv"
+                export_results_csv(self.runner.cfg, nonconv, path_n)
+                split_paths.append((path_n, len(nonconv)))
+        except Exception as e:
+            # Fehler beim Split-Export sind nicht kritisch; Haupt-CSV ist da.
+            messagebox.showwarning(
+                "Hinweis", f"Split-Export (konvergiert/nicht) fehlgeschlagen: {e}")
+            split_paths = []
+
         # Falls Q-Tabellen vorhanden sind, parallel exportieren.
         # Format ist per Radiobutton waehlbar: NPZ (kompakt) oder CSV
         # (eine Datei pro Firma und Seed, gut fuer Excel oder pandas).
         has_q = any(r.q_table is not None for r in self.results
                     if not r.error)
         msg_parts = [f"CSV-Zusammenfassung: {path}"]
+        for sp, count in split_paths:
+            msg_parts.append(f"Split ({count} Laeufe): {sp}")
         fmt = self.q_format_var.get()
         if has_q:
             base = os.path.splitext(path)[0]
@@ -2968,6 +3181,50 @@ def _selftest_run() -> None:
     print(f"[selftest] Mini-Run OK ({sim.t} Schritte, H={H}).")
 
 
+def _selftest_monopoly_small_mu() -> None:
+    """Pruefung des kritischen Niedrig-μ-Falls.
+
+    Frueherer Bug: die Suchgrenze upper = c + 30·μ war an μ gekoppelt.
+    Bei kleinem μ (≤ 0.05) liegt das Monopol-Optimum aber nahe der
+    Qualitaet a, nicht nahe c. Damit lag das berechnete p_M am oberen
+    Rand des Suchbereichs und war massiv zu niedrig — spaeter erzielten
+    Q-Learner Δ > 1.
+
+    Dieser Test prueft drei Dinge:
+      1) Fuer μ ∈ {0.05, 0.01, 0.005, 0.001} liegt p_M strikt im Inneren
+         (deutlich oberhalb der alten falschen Schranke c + 30·μ).
+      2) Das berechnete pi_mono ist ≥ jeder Punkt auf einem dichten Grid
+         (Toleranz 1e-4) — also globales Maximum.
+      3) Joint-Profit am Monopol > 90 % des absoluten Theoriemaximums
+         (a-c)·n/(n+1) bei μ→0.
+    """
+    # Nur diejenigen μ-Werte testen, bei denen der alte Bug aktiv war
+    # (alte Schranke c + 30·μ kleiner als wahres p_M ≈ a). Bei n=2, a=2, c=1:
+    # alte Schranke wird ab μ ≤ ca. 0.033 zu eng.
+    for mu in (0.02, 0.01, 0.005, 0.001):
+        env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=mu)
+        p_m = env.monopoly_prices()
+        pi_m_sum = float(np.sum(env.profits(p_m)))
+        # Alter Bug haette p_m ≈ c + 30·μ geliefert. Jetzt muss p_M strikt
+        # darueber liegen — sonst klemmt der Optimierer am alten Randwert.
+        old_bug_bound = env.c[0] + 30 * mu
+        assert p_m[0] > old_bug_bound + 0.01, \
+            f"μ={mu}: p_M={p_m[0]:.4f} klemmt an alter Schranke {old_bug_bound:.4f}."
+        # Dichte Grid-Suche: gehe weit nach oben, damit das echte Optimum drinliegt
+        grid = np.linspace(env.c[0] + 1e-4, env.a[0] + 5 * mu, 400)
+        best = 0.0
+        for p1 in grid:
+            for p2 in grid:
+                s = float(np.sum(env.profits(np.array([p1, p2]))))
+                if s > best:
+                    best = s
+        assert pi_m_sum >= best - 1e-3, \
+            f"μ={mu}: pi_M={pi_m_sum:.4f} kleiner als bestes Grid {best:.4f}"
+        print(f"[selftest-lowmu] μ={mu:6.4f}  p_M={p_m[0]:.4f}  "
+              f"pi_M_sum={pi_m_sum:.4f}  grid_best={best:.4f}")
+    print("[selftest-lowmu] Niedrig-μ-Optimum OK.")
+
+
 def _selftest_monopoly_global_asymmetric() -> None:
     """Im asymmetrischen Markt (unterschiedliche Qualitaeten a_i) muss
     monopoly_prices() ein Profil liefern, das KEIN diskretes Profil
@@ -3002,6 +3259,41 @@ def _selftest_monopoly_global_asymmetric() -> None:
     print("[selftest-asym] Asymmetrisches Monopol OK.")
 
 
+def _selftest_aggregate_split() -> None:
+    """Pruefung der Split-Aggregation: konvergiert vs. nicht konvergiert."""
+    # Konstruiere kuenstliche RunResults: 3 konvergiert mit hohem Δ, 2 nicht
+    results = [
+        RunResult(seed=1, final_prices=[], final_profits=[],
+                  final_delta=0.9, p_nash=[], p_mono=[], converged=True,
+                  elapsed_s=1.0),
+        RunResult(seed=2, final_prices=[], final_profits=[],
+                  final_delta=0.85, p_nash=[], p_mono=[], converged=True,
+                  elapsed_s=1.0),
+        RunResult(seed=3, final_prices=[], final_profits=[],
+                  final_delta=0.95, p_nash=[], p_mono=[], converged=True,
+                  elapsed_s=1.0),
+        RunResult(seed=4, final_prices=[], final_profits=[],
+                  final_delta=0.40, p_nash=[], p_mono=[], converged=False,
+                  elapsed_s=1.0),
+        RunResult(seed=5, final_prices=[], final_profits=[],
+                  final_delta=0.30, p_nash=[], p_mono=[], converged=False,
+                  elapsed_s=1.0),
+    ]
+    split = aggregate_results_split(results)
+    assert split["all"]["n_runs"] == 5
+    assert split["converged"]["n_runs"] == 3
+    assert split["not_converged"]["n_runs"] == 2
+    assert abs(split["converged"]["mean_delta"] - 0.9) < 1e-9
+    assert abs(split["not_converged"]["mean_delta"] - 0.35) < 1e-9
+    # Differenz: konvergierte 0.9 vs. nicht 0.35 → +0.55
+    diff = split["converged"]["mean_delta"] - split["not_converged"]["mean_delta"]
+    assert abs(diff - 0.55) < 1e-9
+    print(f"[selftest-split] Δ_konv={split['converged']['mean_delta']:.3f}, "
+          f"Δ_nicht={split['not_converged']['mean_delta']:.3f}, "
+          f"diff={diff:+.3f}")
+    print("[selftest-split] aggregate_results_split OK.")
+
+
 def _selftest_delta_leq_one() -> None:
     """Stresstest: Auf dem realen Aktionsraum der Simulation (mit ξ-Erweiterung)
     darf KEIN Profil einen Kollusionsindex Δ > 1 erzeugen.
@@ -3033,7 +3325,9 @@ def _selftest_delta_leq_one() -> None:
 def _run_selftests() -> None:
     print("=== Calvano-Sanity-Tests ===")
     _selftest_calvano_baseline()
+    _selftest_monopoly_small_mu()
     _selftest_monopoly_global_asymmetric()
+    _selftest_aggregate_split()
     _selftest_delta_leq_one()
     _selftest_convergence_policy()
     _selftest_run()
