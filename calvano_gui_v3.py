@@ -91,39 +91,112 @@ class CalvanoEnvironment:
         return sol
 
     def monopoly_prices(self):
-        """Joint-Profit-Maximum: direkte Maximierung (robuster als FOC-Loesung)."""
-        from scipy.optimize import minimize
+        """Joint-Profit-Maximum: globales Maximum ueber alle Preisprofile.
 
-        def neg_joint_profit(p):
-            return -float(np.sum(self.profits(p)))
+        KRITISCHER FIX ggu. v3: Frueher startete L-BFGS-B nur an EINEM Punkt
+        (p_nash + μ) und akzeptierte das erste lokale Optimum (`if result.success`).
+        Bei asymmetrischen Maerkten oder ungewoehnlichen Parametern konnte der
+        Optimierer dadurch in einem lokalen, sub-optimalen Maximum landen.
 
-        # Startwert deutlich oberhalb Nash-Niveau
+        Konkretes Symptom in den Simulationen: Q-Learning fand spaeter
+        Aktionsprofile mit hoeheren Joint-Profits als das vermeintliche
+        Monopol → Kollusionsindex Δ > 1, was mathematisch unmoeglich ist
+        (das Monopol ist per Definition das globale Joint-Profit-Maximum).
+
+        Neue, robuste Strategie:
+          1) Symmetrischer Markt (alle a_i gleich, alle c_i gleich):
+             Das Optimum ist nachweislich symmetrisch (Symmetrie der
+             Zielfunktion). Wir loesen das Problem als 1D-Brent-Suche
+             ueber p ∈ (c_0, c_0 + 30·μ). Bounded-Brent ist auf unimodalen,
+             stetigen Funktionen exakt — fuer Logit-Profite ist die
+             Bedingung erfuellt.
+          2) Asymmetrischer Markt: Multi-Start-L-BFGS-B aus mehreren
+             deterministischen plus zufaelligen Startpunkten. Wir nehmen
+             das BESTE Ergebnis aller Starts, nicht das erste konvergente.
+          3) Plausibilitaetspruefung: Joint-Profit am Optimum muss strikt
+             ueber dem Joint-Profit im Nash-Gleichgewicht liegen. Sonst
+             wird ein aussagekraeftiger RuntimeError geworfen.
+        """
+        from scipy.optimize import minimize, minimize_scalar
+
+        def neg_joint_profit(p_arr):
+            return -float(np.sum(self.profits(p_arr)))
+
         p_nash = self.nash_prices()
-        p0 = p_nash + self.mu
+        pi_nash_sum = -neg_joint_profit(p_nash)
 
-        # Schranken: ueber Grenzkosten, mit grosszuegigem Oberwert
+        # Schranken: oberhalb der Grenzkosten, mit grosszuegigem Oberwert.
+        # 30·μ ist konservativ — bei reiner Logit-Nachfrage verschwindet
+        # die Nachfrage darueber praktisch vollstaendig.
         lower = self.c + 1e-4
         upper = self.c + 30.0 * self.mu
-        bounds = list(zip(lower, upper))
 
-        result = minimize(
-            neg_joint_profit, p0, method="L-BFGS-B", bounds=bounds,
-            options={"ftol": 1e-12, "gtol": 1e-10},
-        )
-        if result.success:
-            return result.x
-        # Fallback: ein paar Startpunkte ausprobieren
-        best_p = p0
-        best_obj = neg_joint_profit(p0)
-        for mult in (1.5, 2.0, 3.0, 5.0):
-            p_try = p_nash * mult
-            r = minimize(
-                neg_joint_profit, p_try, method="L-BFGS-B", bounds=bounds,
-                options={"ftol": 1e-12, "gtol": 1e-10},
+        # ----- Fall 1: Symmetrischer Markt → 1D-Brent ----------------------
+        # Die Symmetrie der Zielfunktion garantiert, dass das Optimum auf
+        # der Diagonalen {p_1 = p_2 = ... = p_n} liegt. Damit reduziert sich
+        # die n-dimensionale Suche auf eine 1D-Optimierung — exakt und
+        # immun gegen lokale Maxima.
+        if (np.allclose(self.a, self.a[0])
+                and np.allclose(self.c, self.c[0])):
+            c0 = float(self.c[0])
+
+            def neg_sym(p_scalar):
+                return -float(np.sum(self.profits(np.full(self.n, p_scalar))))
+
+            lo, hi = c0 + 1e-4, c0 + 30.0 * self.mu
+            res = minimize_scalar(
+                neg_sym, bounds=(lo, hi), method="bounded",
+                options={"xatol": 1e-12},
             )
-            if r.success and r.fun < best_obj:
-                best_obj = r.fun
-                best_p = r.x
+            if -res.fun <= pi_nash_sum + 1e-9:
+                raise RuntimeError(
+                    f"Monopoly-Optimum (symm.) liegt nicht ueber Nash: "
+                    f"pi_mono_sum={-res.fun:.6f}, pi_nash_sum={pi_nash_sum:.6f}."
+                )
+            return np.full(self.n, float(res.x))
+
+        # ----- Fall 2: Asymmetrischer Markt → Multi-Start L-BFGS-B ----------
+        bounds = list(zip(lower, upper))
+        # Deterministische Startpunkte: Mischung aus Nash-Aufschlaegen,
+        # Bound-Mitte und Skalierungen. Mehr Streuung = hoehere Chance,
+        # das globale Maximum zu treffen.
+        starts = [
+            p_nash + self.mu,
+            p_nash + 2.0 * self.mu,
+            (lower + upper) / 2.0,
+            p_nash * 1.2,
+            p_nash * 1.5,
+            p_nash * 2.0,
+        ]
+        # Acht zusaetzliche Zufallsstarts (eigener RNG mit festem Seed,
+        # damit die Reproduzierbarkeit nicht vom Simulationsseed abhaengt).
+        rng_local = np.random.default_rng(20251122)
+        for _ in range(8):
+            starts.append(
+                lower + (upper - lower) * rng_local.uniform(0, 1, self.n))
+
+        best_p, best_obj = None, np.inf
+        for s in starts:
+            s_clipped = np.clip(s, lower, upper)
+            try:
+                r = minimize(
+                    neg_joint_profit, s_clipped, method="L-BFGS-B",
+                    bounds=bounds,
+                    options={"ftol": 1e-12, "gtol": 1e-10},
+                )
+                if r.fun < best_obj:
+                    best_obj, best_p = r.fun, r.x
+            except Exception:
+                continue
+
+        if best_p is None:
+            raise RuntimeError(
+                "Monopoly-Optimierung lieferte fuer keinen Startpunkt "
+                "ein Ergebnis.")
+        if -best_obj <= pi_nash_sum + 1e-9:
+            raise RuntimeError(
+                f"Monopoly-Optimum (asymm.) liegt nicht ueber Nash: "
+                f"pi_mono_sum={-best_obj:.6f}, pi_nash_sum={pi_nash_sum:.6f}.")
         return best_p
 
 
@@ -180,6 +253,20 @@ class QLearningSimulation:
         self.p_min = p_n_mean - xi * (p_m_mean - p_n_mean)
         self.p_max = p_m_mean + xi * (p_m_mean - p_n_mean)
         self.prices = np.linspace(self.p_min, self.p_max, self.m)
+
+        # ---------- Sanity-Guard: Monopol ist globales Joint-Profit-Maximum ----
+        # KRITISCHER FIX (siehe Diskussion zu Δ > 1): wir verifizieren, dass
+        # KEIN diskretes Preisprofil aus dem Aktionsraum mehr Joint-Profit
+        # liefert als das berechnete kontinuierliche Monopol pi_mono. Wenn
+        # doch, ist monopoly_prices() bewiesen falsch — wir loesen sofort
+        # einen aussagekraeftigen Fehler aus, bevor das Q-Learning startet
+        # und falsche Delta-Werte produziert.
+        #
+        # Kosten: m^n Funktionsauswertungen. Fuer n=2, m=15 sind das 225
+        # Auswertungen (< 10 ms). Bei sehr grossen Konfigurationen
+        # (m^n > 10 000) ueberspringen wir die Pruefung — dann muss man
+        # monopoly_prices() implizit vertrauen.
+        self._verify_monopoly_global()
 
         # Q-Tabellen: eine pro Firma, Shape (m^n, m)
         self.n_states = self.m ** self.n
@@ -301,6 +388,46 @@ class QLearningSimulation:
         pi_max = max(pi_candidates)
         q_max = pi_max / max(1.0 - self.delta, 1e-9)
         self.Q[:] = self.rng.uniform(0.0, q_max, size=self.Q.shape)
+
+    def _verify_monopoly_global(self) -> None:
+        """Verifiziert, dass das berechnete kontinuierliche Monopol pi_mono
+        wirklich das globale Joint-Profit-Maximum ist — zumindest auf dem
+        diskreten Aktionsraum, den die Agenten spaeter spielen koennen.
+
+        Methode: brute force ueber alle m^n Preisprofile aus self.prices.
+        Bei Verletzung der Bedingung wird ein AssertionError mit dem
+        Beispielprofil geworfen, das das Monopol schlaegt — das ist eine
+        starke Diagnose des Bugs in CalvanoEnvironment.monopoly_prices().
+
+        Sicherheitsstufen:
+          * symmetrische Maerkte werden trotzdem geprueft (kostet nichts
+            extra und faengt Tippfehler in monopoly_prices ab).
+          * Toleranz von 1e-6 absorbiert numerisches Rauschen, ohne echte
+            Verletzungen zu verschlucken.
+          * Konfigurationen mit m^n > 10 000 werden uebersprungen, sonst
+            wird die Init-Phase ungebuehrlich langsam (Batch x Worker).
+        """
+        if self.m ** self.n > 10_000:
+            return  # zu teuer fuer einen Sanity-Check
+        pi_mono_sum = float(np.sum(self.pi_mono))
+        best_sum = pi_mono_sum
+        offending = None
+        for combo in np.ndindex(*([self.m] * self.n)):
+            p = self.prices[list(combo)]
+            s = float(np.sum(self.env.profits(p)))
+            if s > best_sum + 1e-6:
+                best_sum = s
+                offending = (combo, p.copy(), s)
+        if offending is not None:
+            combo, p, s = offending
+            raise AssertionError(
+                "Bug in CalvanoEnvironment.monopoly_prices() entdeckt: "
+                f"diskretes Aktionsprofil {tuple(int(c) for c in combo)} "
+                f"(Preise {np.round(p, 4).tolist()}) erzielt Joint-Profit "
+                f"{s:.6f}, das berechnete Monopol nur {pi_mono_sum:.6f}. "
+                "Damit waere Delta > 1 moeglich — Optimierung muss verbessert "
+                "werden, bevor das Q-Learning startet."
+            )
 
     def _state_from_actions(self, actions):
         """Kodiere Aktionstupel (a_1, ..., a_n) als flachen State-Index."""
@@ -2841,9 +2968,73 @@ def _selftest_run() -> None:
     print(f"[selftest] Mini-Run OK ({sim.t} Schritte, H={H}).")
 
 
+def _selftest_monopoly_global_asymmetric() -> None:
+    """Im asymmetrischen Markt (unterschiedliche Qualitaeten a_i) muss
+    monopoly_prices() ein Profil liefern, das KEIN diskretes Profil
+    aus dem Aktionsraum schlaegt. Das ist die Garantie fuer Δ ≤ 1.
+    """
+    # Firma 2 hat hoehere Qualitaet → asymmetrisches Monopol
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.5], a0=0.0, c=[1.0, 1.1], mu=0.25)
+    p_mono = env.monopoly_prices()
+    p_nash = env.nash_prices()
+    pi_mono_sum = float(np.sum(env.profits(p_mono)))
+    pi_nash_sum = float(np.sum(env.profits(p_nash)))
+    print(f"[selftest-asym] p_Nash={p_nash}, p_Mono={p_mono}")
+    print(f"[selftest-asym] pi_nash_sum={pi_nash_sum:.4f}, "
+          f"pi_mono_sum={pi_mono_sum:.4f}")
+    assert pi_mono_sum > pi_nash_sum, \
+        "Asymmetrisches Monopol muss Nash strikt schlagen."
+
+    # Brute-Force auf einem dichten 30x30-Gitter: kein Profil darf besser sein.
+    m = 30
+    p1 = np.linspace(env.c[0] + 1e-4, env.c[0] + 5 * env.mu, m)
+    p2 = np.linspace(env.c[1] + 1e-4, env.c[1] + 5 * env.mu, m)
+    best, best_profile = pi_mono_sum, None
+    for a1 in p1:
+        for a2 in p2:
+            s = float(np.sum(env.profits(np.array([a1, a2]))))
+            if s > best + 1e-6:
+                best = s
+                best_profile = (a1, a2, s)
+    assert best_profile is None, (
+        f"BUG: diskretes Profil {best_profile} schlaegt Monopol "
+        f"({pi_mono_sum:.6f}).")
+    print("[selftest-asym] Asymmetrisches Monopol OK.")
+
+
+def _selftest_delta_leq_one() -> None:
+    """Stresstest: Auf dem realen Aktionsraum der Simulation (mit ξ-Erweiterung)
+    darf KEIN Profil einen Kollusionsindex Δ > 1 erzeugen.
+
+    Das ist die ueber den Brute-Force-Sanity-Guard hinausgehende
+    Endkonsumentensicht: wenn das Monopol falsch waere, wuerde dieser Test
+    fehlschlagen.
+    """
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
+    rng = np.random.default_rng(0)
+    sim = QLearningSimulation(
+        env=env, m=15, alpha=0.15, beta=4e-6, delta=0.95, xi=0.1, rng=rng,
+        init_strategy="zeros",
+    )
+    max_delta = -np.inf
+    worst = None
+    for combo in np.ndindex(sim.m, sim.m):
+        p = sim.prices[list(combo)]
+        d = sim.collusion_index(env.profits(p))
+        if d > max_delta:
+            max_delta = d
+            worst = (combo, p, d)
+    print(f"[selftest-delta] max Δ ueber Aktionsraum = {max_delta:+.6f}")
+    assert max_delta <= 1.0 + 1e-6, \
+        f"BUG: Profil {worst} erzeugt Δ = {max_delta:.6f} > 1. "
+    print("[selftest-delta] Δ ≤ 1 garantiert auf vollem Aktionsraum.")
+
+
 def _run_selftests() -> None:
     print("=== Calvano-Sanity-Tests ===")
     _selftest_calvano_baseline()
+    _selftest_monopoly_global_asymmetric()
+    _selftest_delta_leq_one()
     _selftest_convergence_policy()
     _selftest_run()
     print("=== Alle Tests bestanden. ===")
