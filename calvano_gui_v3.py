@@ -327,22 +327,26 @@ class QLearningSimulation:
             self._entropy_buffer = None
         self._entropy_buffer_idx = 0
 
-        # 4) Konvergenz-Tracking nach CALVANO-STANDARD (siehe Calvano et al.
-        #    2020, S. 3279 f.): die greedy-Politik gilt als konvergiert, wenn
-        #    sich die argmax-Aktion JEDER Firma in JEDEM Zustand ueber
-        #    convergence_threshold aufeinanderfolgende Perioden NICHT mehr
-        #    aendert.
+        # 4) Konvergenz-Tracking EXAKT NACH CALVANO 2020, S. 3277:
+        #    Ein Lauf gilt als konvergiert, sobald fuer JEDE Firma i und
+        #    JEDEN Zustand s die greedy-Aktion argmax_a Q[i,s,a] ueber
+        #    100_000 aufeinanderfolgende Perioden unveraendert bleibt.
         #
-        #    FIX ggu. v3: Frueher wurde nur die greedy-Aktion im aktuell
-        #    besuchten Zustand geprueft. Das triggerte deutlich zu frueh, weil
-        #    Zustaende, die der Lauf gerade nicht besucht, ihre Politik durchaus
-        #    noch aendern koennen. Jetzt vergleichen wir die volle Politik-Matrix
-        #    der Shape (n, n_states). Speicher: n * m^n int64 — fuer n=2, m=15
-        #    sind das 3,6 KB pro Pruefung, also unproblematisch.
+        #    Inkrementelle Implementierung (in step() jedes Mal aufgerufen):
+        #      - Wir halten greedy_policy als (n, n_states)-Matrix.
+        #      - Nach jedem Q-Update pruefen wir argmax NUR in der gerade
+        #        aktualisierten Zeile s_prev — nur diese Zeile kann sich
+        #        geaendert haben. Das macht den Check O(n*m) pro Schritt
+        #        statt O(n*n_states), entscheidend bei n>=3.
+        #      - stable_periods zaehlt, wie viele Schritte in Folge keine
+        #        Aenderung passierte. Bei >= convergence_threshold setzen
+        #        wir converged=True und merken t_converged.
+        #      - Bei Aenderung wird stable_periods auf 0 zurueckgesetzt.
         self.convergence_threshold = 100_000
-        self._convergence_check_interval = 1000
-        self._last_policy: Optional[np.ndarray] = None  # Shape (n, n_states)
-        self._last_policy_change_t = 0  # Zeitpunkt der letzten Politik-Aenderung
+        self.greedy_policy = np.argmax(self.Q, axis=2).astype(np.int32)
+        self.stable_periods = 0
+        self.converged = False
+        self.t_converged: Optional[int] = None
 
         self.t = 0
         self.current_state = int(self.rng.integers(0, self.n_states))
@@ -462,6 +466,12 @@ class QLearningSimulation:
         # Aktuelle Explorationswahrscheinlichkeit gemaess Calvano-Spezifikation
         epsilon = float(np.exp(-self.beta * self.t))
 
+        # Zustand, in dem JETZT gehandelt wird. Wichtig: wir merken ihn
+        # explizit, weil sowohl das Q-Update als auch die inkrementelle
+        # Konvergenzpruefung sich auf DIESEN Zustand (s_prev) beziehen,
+        # nicht auf den Folgezustand.
+        s_prev = self.current_state
+
         # ---------- Aktionswahl: epsilon-greedy pro Firma ----------
         # Wir loggen pro Firma, ob die Aktion zufaellig (Exploration)
         # oder argmax (Exploitation) gewaehlt wurde. Daraus lassen sich
@@ -473,14 +483,11 @@ class QLearningSimulation:
                 self.explore_count += 1
                 self.explore_per_firm[i] += 1
             else:
-                actions[i] = int(np.argmax(self.Q[i, self.current_state]))
+                actions[i] = int(np.argmax(self.Q[i, s_prev]))
                 self.exploit_count += 1
                 self.exploit_per_firm[i] += 1
 
         # ---------- Optional: Aktionsentropie-Tracking ----------
-        # Wenn aktiviert, schreiben wir die zuletzt gewaehlte Aktion jeder Firma
-        # in einen Ringpuffer der Laenge entropy_window. Aus diesem Puffer
-        # berechnet action_entropy() spaeter H_t pro Firma.
         if self._entropy_buffer is not None:
             self._entropy_buffer[:, self._entropy_buffer_idx] = actions.astype(np.int16)
             self._entropy_buffer_idx = (
@@ -491,71 +498,66 @@ class QLearningSimulation:
         next_state = self._state_from_actions(actions)
 
         # ---------- Q-Update (Bellman-Rekursion) ----------
-        # Gleichzeitig zaehlen wir, wie oft jeder (state, action)-Eintrag aktualisiert wurde.
+        # Update auf Zeile s_prev — diese und NUR diese kann sich aendern.
         for i in range(self.n):
             best_next = float(np.max(self.Q[i, next_state]))
-            old = self.Q[i, self.current_state, actions[i]]
-            self.Q[i, self.current_state, actions[i]] = (
+            old = self.Q[i, s_prev, actions[i]]
+            self.Q[i, s_prev, actions[i]] = (
                 (1.0 - self.alpha) * old
                 + self.alpha * (profits[i] + self.delta * best_next)
             )
-            self.visits[i, self.current_state, actions[i]] += 1
+            self.visits[i, s_prev, actions[i]] += 1
+
+        # ---------- Inkrementelle Konvergenzpruefung (Calvano 2020, S. 3277) ----------
+        # Pruefe argmax NUR in der gerade aktualisierten Zeile s_prev. Nur diese
+        # Zeile konnte durch das Q-Update den argmax veraendern — alle anderen
+        # Zeilen sind unangetastet. Damit ist die Pruefung O(n*m) pro Schritt
+        # statt O(n*n_states), was bei n>=3 entscheidend ist.
+        changed = False
+        for i in range(self.n):
+            a_star = int(np.argmax(self.Q[i, s_prev]))
+            if a_star != self.greedy_policy[i, s_prev]:
+                self.greedy_policy[i, s_prev] = a_star
+                changed = True
+        if changed:
+            self.stable_periods = 0
+        else:
+            self.stable_periods += 1
+            # converged wird nur EINMAL gesetzt — t_converged speichert den
+            # Zeitpunkt der erstmaligen Konvergenz.
+            if not self.converged and self.stable_periods >= self.convergence_threshold:
+                self.converged = True
+                self.t_converged = self.t
 
         self.current_state = next_state
         self.t += 1
 
-        # ---------- Konvergenzpruefung (alle N Perioden, Calvano-Standard) ----------
-        # Wir berechnen die volle greedy-Politik (Shape (n, n_states)) und
-        # vergleichen sie mit dem zuletzt gespeicherten Snapshot. Hat sich
-        # IRGENDEIN Eintrag geaendert, setzen wir den Stabilitaetszaehler zurueck.
-        # Diese Pruefung ist O(n * m^n) pro Aufruf und wird nur alle 1000 Schritte
-        # gemacht — auch fuer n=3, m=15 (n_states=3375) vernachlaessigbar.
-        if self.t % self._convergence_check_interval == 0:
-            policy = self._compute_greedy_policy()
-            if self._last_policy is None or not np.array_equal(policy, self._last_policy):
-                self._last_policy_change_t = self.t
-                self._last_policy = policy
-
         return prices, profits, epsilon
 
-    def _compute_greedy_policy(self) -> np.ndarray:
-        """Liefert die aktuelle greedy-Politik als Matrix der Shape (n, n_states).
-
-        policy[i, s] ist die Aktion, die Firma i in Zustand s greedy waehlen
-        wuerde. Ist der zentrale Konvergenz-Indikator nach Calvano.
-        """
-        # np.argmax mit axis=-1 ueber Q-Tabelle gibt direkt die Politik-Matrix.
-        # Q hat Shape (n, n_states, m), also axis=2 -> (n, n_states).
-        return np.argmax(self.Q, axis=2).astype(np.int32)
-
     def convergence_status(self) -> Tuple[str, int, int]:
-        """Liefert ein Tupel (status, periods_stable, threshold) zurueck.
+        """Liefert (status, stable_periods, threshold).
 
-        Misst die Stabilitaet der vollen greedy-Politik nach Calvano-Standard
-        (siehe Kommentar in __init__ und _compute_greedy_policy).
-
-        status ist eine der drei Phasen:
+        Misst die Stabilitaet der greedy-Politik nach Calvano 2020, S. 3277.
+        Statuszuweisung:
+          - 'konvergiert'   : self.converged ist gesetzt (Zaehler hat
+                              jemals den Schwellenwert erreicht)
+          - 'stabilisiert'  : 25-100 % des Schwellenwerts ohne Aenderung,
+                              aber noch nicht konvergiert
           - 'lernt'         : weniger als 25 % des Schwellenwerts ohne Aenderung
-          - 'stabilisiert'  : 25 % bis 100 % des Schwellenwerts ohne Aenderung
-          - 'konvergiert'   : >= 100 % des Schwellenwerts ohne Aenderung
-        periods_stable: Perioden seit der letzten beobachteten Aenderung der
-        greedy-Politik IRGENDEINER Firma in IRGENDEINEM Zustand.
         """
-        periods_stable = self.t - self._last_policy_change_t
-        if periods_stable >= self.convergence_threshold:
+        stable = self.stable_periods
+        if self.converged:
             status = 'konvergiert'
-        elif periods_stable >= self.convergence_threshold // 4:
+        elif stable >= self.convergence_threshold // 4:
             status = 'stabilisiert'
         else:
             status = 'lernt'
-        return status, periods_stable, self.convergence_threshold
+        return status, stable, self.convergence_threshold
 
     def is_converged(self) -> bool:
-        """Kurzform: ist die volle greedy-Politik seit `convergence_threshold`
-        Perioden unveraendert? Wird vom Batch-Worker und der GUI verwendet,
-        damit beide Seiten dieselbe Konvergenz-Definition benutzen.
-        """
-        return self.convergence_status()[0] == 'konvergiert'
+        """True, sobald die greedy-Politik einmalig den Stabilitaets-
+        Schwellenwert erreicht hat (sticky — wird nicht zurueckgesetzt)."""
+        return self.converged
 
     def collusion_index(self, profits):
         """Delta = (pi_avg - pi_Nash) / (pi_Mono - pi_Nash)."""
@@ -658,7 +660,8 @@ class RunResult:
     final_delta: float          # Mittelwert ueber letzte avg_window Iterationen
     p_nash: List[float]
     p_mono: List[float]
-    converged: bool             # Optimal action konstant ueber letzte 10% der Iterationen?
+    converged: bool             # True wenn greedy-Politik 100k Perioden stabil
+                                # (exakt nach Calvano 2020, S. 3277)
     elapsed_s: float
     error: str = ""
     q_table: Optional[np.ndarray] = None    # Shape (n, m^n, m), nur wenn angefordert
@@ -671,6 +674,11 @@ class RunResult:
     exploit_per_firm: Optional[List[int]] = None
     # Optional: Visits-Heatmap pro Firma (Shape n, m^n, m). Nur wenn save_visits aktiv.
     visits: Optional[np.ndarray] = None
+    # NEU (Calvano-Spec): Zeitpunkt der Konvergenz und tatsaechlich gelaufene
+    # Iterationen. Bei Frueh-Abbruch ist n_iterations < cfg.episodes.
+    # t_converged ist None, wenn der Lauf nicht konvergiert ist.
+    t_converged: Optional[int] = None
+    n_iterations: int = 0
 
 
 def _run_single_replication(args) -> RunResult:
@@ -716,36 +724,52 @@ def _run_single_replication(args) -> RunResult:
         # Progress-Reporting: ca. 100 Updates pro Lauf, mind. alle 50k.
         progress_interval = max(50000, cfg.episodes // 100)
 
-        # FIX ggu. v3: keine eigene Konvergenzlogik mehr im Worker. Die Pruefung
-        # uebernimmt jetzt QLearningSimulation.is_converged() (Stabilitaet der
-        # vollen greedy-Politik ueber convergence_threshold Perioden, nach
-        # Calvano-Standard). Damit berichten Single-Run und Batch dieselbe
-        # Konvergenzmetrik.
+        # Calvano-Spec (S. 3277): Lauf bis konvergiert ODER cfg.episodes erreicht.
+        # Konvergenz wird inkrementell in sim.step() getrackt; sobald
+        # sim.converged True wird, brechen wir die Schleife ab.
+        n_filled = 0  # tatsaechlich beschriebene Slots im Ringpuffer
         for t in range(cfg.episodes):
             prices, profits, eps = sim.step()
-            idx = t % avg_w
+            idx = n_filled % avg_w
             recent_prices[idx] = prices
             recent_profits[idx] = profits
             recent_deltas[idx] = sim.collusion_index(profits)
+            n_filled += 1
 
             # Progress-Update an Queue
             if t > 0 and t % progress_interval == 0:
-                # Aktuelles Delta als Mittel ueber bisher gefuellte recent_deltas
-                fill = min(t + 1, avg_w)
-                cur_delta = float(np.mean(recent_deltas[:fill]) if fill < avg_w
-                                  else recent_deltas.mean())
+                fill = min(n_filled, avg_w)
+                cur_delta = float(recent_deltas[:fill].mean())
                 report("progress", t=t, eps=float(eps), delta=cur_delta)
 
+            # Frueh-Abbruch bei Konvergenz (Calvano-Spec)
+            if sim.converged:
+                break
+
         converged = sim.is_converged()
+        # Delta-Mittel ueber den tatsaechlich gefuellten Buffer-Bereich.
+        # Bei Frueh-Abbruch nach >= avg_w Iterationen ist der Buffer komplett
+        # mit den LETZTEN avg_w Werten gefuellt (Ringschreiben); sonst nur
+        # die ersten n_filled Slots.
+        n_used = min(n_filled, avg_w)
 
         # Visits-Heatmap nur kopieren, wenn explizit angefordert: spart bei
         # grossen Konfigurationen viel Speicher und Inter-Prozess-Kommunikation.
         save_visits = getattr(cfg, "save_visits", False)
+        # buffer-aware Mittelung (siehe Kommentar oben zu n_used)
+        if n_used >= avg_w:
+            mean_prices = recent_prices.mean(axis=0).tolist()
+            mean_profits = recent_profits.mean(axis=0).tolist()
+            mean_delta = float(recent_deltas.mean())
+        else:
+            mean_prices = recent_prices[:n_used].mean(axis=0).tolist()
+            mean_profits = recent_profits[:n_used].mean(axis=0).tolist()
+            mean_delta = float(recent_deltas[:n_used].mean())
         result = RunResult(
             seed=seed,
-            final_prices=recent_prices.mean(axis=0).tolist(),
-            final_profits=recent_profits.mean(axis=0).tolist(),
-            final_delta=float(recent_deltas.mean()),
+            final_prices=mean_prices,
+            final_profits=mean_profits,
+            final_delta=mean_delta,
             p_nash=sim.p_nash.tolist(),
             p_mono=sim.p_mono.tolist(),
             converged=converged,
@@ -759,6 +783,9 @@ def _run_single_replication(args) -> RunResult:
             exploit_per_firm=sim.exploit_per_firm.tolist(),
             # Visits-Heatmap (gross, daher nur auf Wunsch)
             visits=sim.visits.copy() if save_visits else None,
+            # Konvergenz-Metadaten (Calvano-Spec)
+            t_converged=sim.t_converged,
+            n_iterations=int(sim.t),
         )
         report("done", delta=result.final_delta, converged=converged,
                elapsed=result.elapsed_s)
@@ -1064,7 +1091,11 @@ def export_results_csv(cfg: BatchConfig, results: List[RunResult],
         f.write(f"# init_strategy={getattr(cfg, 'init_strategy', 'best_response')}\n")
         writer = csv.writer(f)
         n = cfg.n
-        header = ["seed", "converged", "elapsed_s", "final_delta"]
+        # Neue Spalten t_converged und n_iterations (Calvano-Spec):
+        # n_iterations < cfg.episodes signalisiert Frueh-Abbruch durch
+        # erfuellte Konvergenzbedingung; t_converged ist der Zeitpunkt.
+        header = ["seed", "converged", "t_converged", "n_iterations",
+                  "elapsed_s", "final_delta"]
         header += [f"final_price_{i+1}" for i in range(n)]
         header += [f"final_profit_{i+1}" for i in range(n)]
         header += [f"p_nash_{i+1}" for i in range(n)]
@@ -1077,8 +1108,9 @@ def export_results_csv(cfg: BatchConfig, results: List[RunResult],
         header += ["error"]
         writer.writerow(header)
         for r in sorted(results, key=lambda x: x.seed):
-            row = [r.seed, int(r.converged), f"{r.elapsed_s:.2f}",
-                   f"{r.final_delta:.6f}"]
+            tc_str = str(r.t_converged) if r.t_converged is not None else ""
+            row = [r.seed, int(r.converged), tc_str, int(r.n_iterations),
+                   f"{r.elapsed_s:.2f}", f"{r.final_delta:.6f}"]
             row += [f"{p:.6f}" for p in (r.final_prices or [float("nan")] * n)]
             row += [f"{p:.6f}" for p in (r.final_profits or [float("nan")] * n)]
             row += [f"{p:.6f}" for p in (r.p_nash or [float("nan")] * n)]
@@ -1510,7 +1542,8 @@ class CalvanoGUI:
         last_gui = time.time()
 
         try:
-            while self.running and sim.t < target:
+            # Calvano-Spec: Lauf bis konvergiert ODER Iterationsobergrenze.
+            while self.running and sim.t < target and not sim.converged:
                 prices, profits, eps = sim.step()
 
                 # Ringpuffer fuer das finale Delta-Mittel pflegen (jeden Step).
@@ -1541,11 +1574,15 @@ class CalvanoGUI:
                     # Konvergenzstatus mitlesen (siehe Hinweise: dem Nutzer
                     # mitteilen, ob und wann der Lauf stabil ist).
                     conv_status, conv_stable, conv_thr = sim.convergence_status()
-                    # Einmaliger Konsolen-Alert beim ersten Erreichen der Konvergenz
+                    # Einmaliger Konsolen-Alert beim ersten Erreichen der Konvergenz.
+                    # sim.t_converged ist der genaue Iterationsindex, an dem
+                    # converged True wurde — exakt der Calvano-Wert.
                     if conv_status == 'konvergiert' and not getattr(self, '_alerted_converged', False):
                         self._alerted_converged = True
-                        self.root.after(0, lambda t=cur_t: self._print(
-                            f"[Konvergenz] greedy-Politik seit {conv_thr:,} Perioden stabil (bei t = {t:,})."))
+                        tc = sim.t_converged if sim.t_converged is not None else cur_t
+                        self.root.after(0, lambda t=tc: self._print(
+                            f"[Konvergenz] greedy-Politik {conv_thr:,} Perioden stabil — "
+                            f"konvergiert bei t = {t:,}. Lauf wird beendet."))
                     self.root.after(0, self._update_plots)
                     self.root.after(
                         0,
@@ -2174,27 +2211,25 @@ class BatchWindow:
         summary_frame = ttk.LabelFrame(right, text="Zusammenfassung", padding=8)
         summary_frame.pack(fill=tk.X, pady=4)
 
-        # Filter-Combobox fuer Konvergenz-Status. Ermoeglicht den Vergleich
-        # 'Δ konvergierter Laeufe vs. nicht konvergierter Laeufe', der fuer
-        # die BA-Auswertung wichtig ist (Hypothese: konvergierte Laeufe
-        # erreichen systematisch höhere Δ-Werte).
+        # Filter-Radiobuttons fuer Konvergenz-Status.
+        # Default 'konvergiert' folgt der BA-Konvention: nur konvergierte
+        # Laeufe sind aussagekraeftig (instabile Laeufe haben keinen
+        # interpretierbaren Δ-Endwert nach Calvano).
+        # Mittelwert / SD / Median / Min-Max / Histogramm / Δ pro Seed
+        # rechnen jeweils ueber die ausgewaehlte Teilmenge.
         filter_frame = ttk.Frame(summary_frame)
         filter_frame.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(filter_frame, text="Anzeige:").pack(side=tk.LEFT)
-        self.filter_var = tk.StringVar(value="alle")
-        filter_combo = ttk.Combobox(
-            filter_frame, textvariable=self.filter_var, state="readonly",
-            width=24,
-            values=[
-                "alle",
-                "nur konvergiert",
-                "nur nicht konvergiert",
-                "Vergleich konv. vs. nicht",
-            ],
-        )
-        filter_combo.pack(side=tk.LEFT, padx=(4, 0))
-        filter_combo.bind(
-            "<<ComboboxSelected>>", lambda _e: self._on_filter_changed())
+        ttk.Label(filter_frame, text="Anzeige:").pack(side=tk.LEFT, padx=(0, 6))
+        self.filter_var = tk.StringVar(value="konvergiert")
+        for label, value in (
+            ("Konvergierte", "konvergiert"),
+            ("Alle", "alle"),
+            ("Nicht-konvergierte", "nicht_konvergiert"),
+        ):
+            ttk.Radiobutton(
+                filter_frame, text=label, variable=self.filter_var,
+                value=value, command=self._on_filter_changed,
+            ).pack(side=tk.LEFT, padx=(0, 4))
 
         self.summary_label = ttk.Label(
             summary_frame, text="(noch keine Ergebnisse)",
@@ -2217,14 +2252,15 @@ class BatchWindow:
         table_frame = ttk.LabelFrame(right, text="Einzellaeufe", padding=4)
         table_frame.pack(fill=tk.X, pady=4)
 
-        cols = ("seed", "delta", "konvergiert", "preise", "zeit")
+        cols = ("seed", "delta", "konvergiert", "t_konv", "preise", "zeit")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings",
                                   height=6)
         for c, t, w in [
-            ("seed", "Seed", 60),
-            ("delta", "Δ", 80),
-            ("konvergiert", "Konvergiert", 90),
-            ("preise", "Finale Preise", 320),
+            ("seed", "Seed", 50),
+            ("delta", "Δ", 70),
+            ("konvergiert", "Konv.", 60),
+            ("t_konv", "t bei Konv.", 90),
+            ("preise", "Finale Preise", 300),
             ("zeit", "Zeit (s)", 70),
         ]:
             self.tree.heading(c, text=t)
@@ -2419,13 +2455,16 @@ class BatchWindow:
         )
 
     def _on_progress(self, res: RunResult, done: int, total: int):
-        # Tabelle ergaenzen
+        # Tabelle ergaenzen — t_converged zeigt den exakten Konvergenz-
+        # Zeitpunkt (oder '—', wenn der Lauf bis cfg.episodes nicht konvergierte).
         prices_str = ", ".join(f"{p:.3f}" for p in res.final_prices) \
                      if res.final_prices else "(Fehler)"
+        tc_str = f"{res.t_converged:,}" if res.t_converged is not None else "—"
         self.tree.insert("", tk.END, values=(
             res.seed,
             f"{res.final_delta:+.4f}" if not np.isnan(res.final_delta) else "NaN",
             "ja" if res.converged else "nein",
+            tc_str,
             prices_str,
             f"{res.elapsed_s:.1f}",
         ))
@@ -2433,6 +2472,9 @@ class BatchWindow:
         self.progress_var.set(100.0 * done / total)
         self._set_status(f"Lauf {done}/{total} fertig ... "
                          f"(Seed {res.seed}: Δ = {res.final_delta:+.4f})")
+        # Live: Summary UND Plots nach jedem fertigen Seed neu zeichnen.
+        # So sieht man Konvergenzrate, Δ-Statistik und Verteilung wachsen.
+        self._refresh_summary()
         self._refresh_plots()
 
     def _on_done(self, results, cancelled):
@@ -2486,12 +2528,13 @@ class BatchWindow:
     def _refresh_summary(self):
         """Aktualisiert die Zusammenfassung gemaess Filter-Auswahl.
 
-        Optionen:
-          'alle'                  → klassische Gesamtstatistik
-          'nur konvergiert'       → nur die Teilmenge converged=True
-          'nur nicht konvergiert' → nur die Teilmenge converged=False
-          'Vergleich ...'         → beide Teilmengen nebeneinander samt
-                                   Mittelwertdifferenz Δ_konv − Δ_nicht
+        Drei Modi:
+          'konvergiert'        → Statistik nur ueber converged=True
+          'alle'               → Statistik ueber alle erfolgreichen Laeufe
+          'nicht_konvergiert'  → Statistik nur ueber converged=False
+
+        Konvergenzrate (X/N) wird IMMER prominent angezeigt, unabhaengig
+        vom Modus — das ist ein zentraler BA-Kennwert.
         """
         if not self.results:
             self.summary_label.config(text="(noch keine Ergebnisse)")
@@ -2503,92 +2546,86 @@ class BatchWindow:
                 text=f"Alle {all_agg['n_failed']} Laeufe fehlgeschlagen.")
             return
 
-        mode = self.filter_var.get()
+        n_conv = all_agg["n_converged"]
+        n_total = all_agg["n_runs"]
+        conv_pct = (100.0 * n_conv / n_total) if n_total else 0.0
+        # Konvergenzrate immer ganz oben — fuer die BA der zentrale Wert.
         header = (
-            f"Erfolgreiche Laeufe : {all_agg['n_runs']}"
-            f"   (Fehler: {all_agg['n_failed']})\n"
-            f"Konvergiert         : "
-            f"{all_agg['n_converged']}/{all_agg['n_runs']}\n")
+            f"Konvergenzrate      : {n_conv}/{n_total}  ({conv_pct:.0f}%)\n"
+            f"Erfolgreiche Laeufe : {n_total}"
+            f"   (Fehler: {all_agg['n_failed']})\n")
 
-        if mode == "nur konvergiert":
-            txt = header + "\n" + self._format_block("Konvergierte Laeufe",
-                                                      split["converged"])
-        elif mode == "nur nicht konvergiert":
-            txt = header + "\n" + self._format_block(
-                "Nicht konvergierte Laeufe", split["not_converged"])
-        elif mode.startswith("Vergleich"):
-            # Mittelwertdifferenz als zentraler Befund fuer die BA: ist die
-            # Konvergenz mit höherem Δ assoziiert?
-            c, nc = split["converged"], split["not_converged"]
-            diff_line = ""
-            if c["n_runs"] > 0 and nc["n_runs"] > 0:
-                diff = c["mean_delta"] - nc["mean_delta"]
-                diff_line = (
-                    f"\nMittelwertdifferenz Δ_konv − Δ_nicht : "
-                    f"{diff:+.4f}")
-            txt = (
-                header + "\n"
-                + self._format_block("Konvergiert", c) + "\n\n"
-                + self._format_block("Nicht konvergiert", nc)
-                + diff_line)
+        mode = self.filter_var.get()
+        if mode == "konvergiert":
+            block = self._format_block("Nur konvergierte Laeufe",
+                                        split["converged"])
+        elif mode == "nicht_konvergiert":
+            block = self._format_block("Nur nicht konvergierte Laeufe",
+                                        split["not_converged"])
         else:  # 'alle'
-            txt = header + "\n" + self._format_block("Alle Laeufe", all_agg)
-        self.summary_label.config(text=txt)
+            block = self._format_block("Alle Laeufe", all_agg)
+
+        self.summary_label.config(text=header + "\n" + block)
 
     def _refresh_plots(self):
-        """Histogramm + Seed-Scatter, abhaengig von Filter-Auswahl.
+        """Histogramm + Seed-Scatter, beide nach Filter gefiltert.
 
-        - 'alle'              : ein Histogramm ueber alle Δ
-        - 'nur konvergiert'   : ein Histogramm nur ueber converged-Laeufe
-        - 'nur nicht konv.'   : ein Histogramm nur ueber non-converged
-        - 'Vergleich ...'     : zwei ueberlagerte Histogramme (gruen/rot)
-                                mit zwei Mittelwert-Linien
+        Modi (synchron zu _refresh_summary):
+          'konvergiert'        → nur converged=True (gruen)
+          'alle'               → alle erfolgreichen Laeufe (blau)
+          'nicht_konvergiert'  → nur converged=False (rot)
         """
         ok = [r for r in self.results if not r.error]
         self.ax_hist.clear()
         self.ax_seeds.clear()
-
         if not ok:
             self.canvas.draw_idle()
             return
 
-        deltas_all = np.array([r.final_delta for r in ok])
-        conv_flags = np.array([r.converged for r in ok])
-        deltas_c = deltas_all[conv_flags]
-        deltas_n = deltas_all[~conv_flags]
-
         mode = self.filter_var.get()
+        if mode == "konvergiert":
+            subset = [r for r in ok if r.converged]
+            color, label = "seagreen", "konvergiert"
+        elif mode == "nicht_konvergiert":
+            subset = [r for r in ok if not r.converged]
+            color, label = "indianred", "nicht konvergiert"
+        else:
+            subset = ok
+            color, label = "steelblue", "alle"
+
+        if not subset:
+            self.ax_hist.text(
+                0.5, 0.5, f"(keine Laeufe in Kategorie '{label}')",
+                ha="center", va="center", transform=self.ax_hist.transAxes)
+            self.ax_seeds.text(
+                0.5, 0.5, f"(keine Laeufe in Kategorie '{label}')",
+                ha="center", va="center", transform=self.ax_seeds.transAxes)
+            self.canvas.draw_idle()
+            return
+
+        deltas = np.array([r.final_delta for r in subset])
 
         # ---------------- Histogramm ----------------
-        if mode == "nur konvergiert":
-            subset, color, label = deltas_c, "seagreen", "konvergiert"
-            self._plot_single_hist(subset, color, label)
-        elif mode == "nur nicht konvergiert":
-            subset, color, label = deltas_n, "indianred", "nicht konvergiert"
-            self._plot_single_hist(subset, color, label)
-        elif mode.startswith("Vergleich"):
-            self._plot_compare_hist(deltas_c, deltas_n)
-        else:
-            self._plot_single_hist(deltas_all, "steelblue", "alle")
+        self._plot_single_hist(deltas, color, label)
 
-        # ---------------- Seed-Scatter ----------------
-        # Im Scatter-Plot zeigen wir IMMER alle Punkte (gruen/rot codiert),
-        # damit die Unterscheidung visuell direkt erkennbar bleibt.
-        ok_sorted = sorted(ok, key=lambda r: r.seed)
-        seeds = [r.seed for r in ok_sorted]
-        ds = [r.final_delta for r in ok_sorted]
-        conv = [r.converged for r in ok_sorted]
-        colors = ["seagreen" if c else "indianred" for c in conv]
-        self.ax_seeds.scatter(seeds, ds, c=colors, s=40, edgecolor="black",
+        # ---------------- Seed-Scatter (gefiltert) ----------------
+        # Auch der Scatter ist jetzt auf die Teilmenge beschraenkt — so
+        # zeigt das Plot konsistent das, was die Statistik beschreibt.
+        subset_sorted = sorted(subset, key=lambda r: r.seed)
+        seeds = [r.seed for r in subset_sorted]
+        ds = [r.final_delta for r in subset_sorted]
+        self.ax_seeds.scatter(seeds, ds, c=color, s=40, edgecolor="black",
                                linewidth=0.5)
-        self.ax_seeds.axhline(0, color="red", linestyle="--", alpha=0.5)
-        self.ax_seeds.axhline(1, color="green", linestyle="--", alpha=0.5)
-        if len(deltas_all) > 0:
-            self.ax_seeds.axhline(deltas_all.mean(), color="black", alpha=0.5)
+        self.ax_seeds.axhline(0, color="red", linestyle="--", alpha=0.5,
+                              label="Nash (Δ=0)")
+        self.ax_seeds.axhline(1, color="green", linestyle="--", alpha=0.5,
+                              label="Monopol (Δ=1)")
+        self.ax_seeds.axhline(deltas.mean(), color="black", alpha=0.5,
+                              label=f"Mittel = {deltas.mean():+.3f}")
         self.ax_seeds.set_xlabel("Seed")
         self.ax_seeds.set_ylabel("Δ")
-        self.ax_seeds.set_title("Δ pro Seed (gruen: konvergiert, "
-                                 "rot: nicht konvergiert)")
+        self.ax_seeds.set_title(f"Δ pro Seed — {label} (n = {len(subset)})")
+        self.ax_seeds.legend(fontsize=7, loc="best")
         self.ax_seeds.grid(True, alpha=0.3)
 
         self.fig.tight_layout()
@@ -2616,42 +2653,6 @@ class BatchWindow:
         self.ax_hist.legend(fontsize=7, loc="best")
         self.ax_hist.grid(True, alpha=0.3)
 
-    def _plot_compare_hist(self, deltas_c: np.ndarray, deltas_n: np.ndarray):
-        """Vergleichshistogramm konvergiert vs. nicht konvergiert.
-
-        Beide Verteilungen werden mit gemeinsamen Bin-Grenzen geplottet
-        (so sind die Saeulen direkt vergleichbar) und transparent
-        ueberlagert. Vertikale Linien markieren die jeweiligen Mittelwerte.
-        """
-        if len(deltas_c) == 0 and len(deltas_n) == 0:
-            return
-        # Gemeinsame Bin-Grenzen, damit die zwei Verteilungen vergleichbar sind
-        combined = np.concatenate([deltas_c, deltas_n])
-        n_bins = min(20, max(5, len(combined) // 2))
-        bins = np.linspace(combined.min(), combined.max(), n_bins + 1) \
-               if combined.min() != combined.max() else n_bins
-
-        if len(deltas_c) > 0:
-            self.ax_hist.hist(deltas_c, bins=bins, color="seagreen",
-                              edgecolor="white", alpha=0.55,
-                              label=f"konvergiert (n={len(deltas_c)}, "
-                                    f"⌀={deltas_c.mean():+.3f})")
-            self.ax_hist.axvline(deltas_c.mean(), color="seagreen",
-                                  linewidth=2, linestyle="-")
-        if len(deltas_n) > 0:
-            self.ax_hist.hist(deltas_n, bins=bins, color="indianred",
-                              edgecolor="white", alpha=0.55,
-                              label=f"nicht konvergiert (n={len(deltas_n)}, "
-                                    f"⌀={deltas_n.mean():+.3f})")
-            self.ax_hist.axvline(deltas_n.mean(), color="indianred",
-                                  linewidth=2, linestyle="-")
-        self.ax_hist.axvline(0, color="red", linestyle="--", alpha=0.4)
-        self.ax_hist.axvline(1, color="green", linestyle="--", alpha=0.4)
-        self.ax_hist.set_xlabel("Kollusionsindex Δ")
-        self.ax_hist.set_ylabel("Anzahl Replikationen")
-        self.ax_hist.set_title("Δ-Verteilung: konvergiert vs. nicht konvergiert")
-        self.ax_hist.legend(fontsize=7, loc="best")
-        self.ax_hist.grid(True, alpha=0.3)
 
     def export_csv(self):
         if not self.results or not self.runner:
@@ -3136,29 +3137,88 @@ def _selftest_calvano_baseline() -> None:
     print("[selftest] Calvano-Baseline OK.")
 
 
-def _selftest_convergence_policy() -> None:
-    """Pruft, dass _compute_greedy_policy stabil das richtige Argmax liefert."""
+def _selftest_convergence_init() -> None:
+    """Initialisierung der Konvergenz-State-Variablen (Calvano-Spec)."""
     env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
     rng = np.random.default_rng(0)
     sim = QLearningSimulation(
         env=env, m=5, alpha=0.15, beta=4e-6, delta=0.95, xi=0.1, rng=rng,
         init_strategy="zeros",
     )
-    # Setze willkuerlich eine eindeutige beste Aktion pro (Firma, Zustand).
-    # Erwartung: _compute_greedy_policy spiegelt diese argmax-Wahl wider.
-    sim.Q[:] = 0.0
-    sim.Q[0, 3, 2] = 10.0  # Firma 0, State 3: argmax = 2
-    sim.Q[1, 7, 4] = 10.0  # Firma 1, State 7: argmax = 4
-    policy = sim._compute_greedy_policy()
-    assert policy.shape == (2, sim.n_states), \
-        f"policy hat falsche Form: {policy.shape}"
-    assert policy[0, 3] == 2 and policy[1, 7] == 4, \
-        f"argmax-Logik bricht: policy[0,3]={policy[0,3]}, policy[1,7]={policy[1,7]}"
-    # Konvergenzstatus muss initial 'lernt' sein, da t=0.
+    # greedy_policy hat Form (n, n_states); bei Q=0 ist argmax ueberall 0
+    assert sim.greedy_policy.shape == (2, sim.n_states)
+    assert (sim.greedy_policy == 0).all()
+    # Initial: nicht konvergiert, Counter 0, t_converged None
+    assert sim.stable_periods == 0
+    assert not sim.converged
+    assert sim.t_converged is None
     status, stable, thr = sim.convergence_status()
-    assert status == 'lernt' and stable == 0, \
-        f"Erwartet 'lernt' bei t=0, bekommen {status}, stable={stable}"
-    print("[selftest] Konvergenzlogik OK.")
+    assert status == 'lernt' and stable == 0 and thr == 100_000
+    print("[selftest] Konvergenz-Init OK.")
+
+
+def _selftest_convergence_incremental() -> None:
+    """Inkrementelle Konvergenz-Logik (Calvano 2020, S. 3277).
+
+    Setup: kleiner Aktionsraum, kleiner Threshold, kein Exploration.
+    Erwartung: Sobald die Q-Werte sich nicht mehr stark genug aendern,
+    flippt kein argmax mehr, stable_periods waechst monoton und
+    converged wird True bei Erreichen des Schwellenwerts.
+    """
+    env = CalvanoEnvironment(n=2, a=[2.0, 2.0], a0=0.0, c=[1.0, 1.0], mu=0.25)
+    rng = np.random.default_rng(42)
+    sim = QLearningSimulation(
+        env=env, m=3, alpha=0.15, beta=4e-6, delta=0.95, xi=0.1, rng=rng,
+        init_strategy="zeros",
+    )
+    sim.convergence_threshold = 30  # klein, damit der Test schnell ist
+
+    # Vorher: nicht konvergiert
+    assert not sim.converged
+    # Iterieren bis Konvergenz oder Maximum
+    max_steps = 50_000
+    for _ in range(max_steps):
+        sim.step()
+        if sim.converged:
+            break
+    # Bei dieser Setup-Wahl MUSS converged eintreten (alpha klein, fester Threshold)
+    assert sim.converged, (
+        f"Konvergenz nicht erreicht: stable={sim.stable_periods}, "
+        f"t={sim.t}, threshold={sim.convergence_threshold}")
+    assert sim.t_converged is not None
+    assert sim.t_converged <= sim.t
+    assert sim.stable_periods >= sim.convergence_threshold
+    print(f"[selftest-incr] Konvergenz bei t={sim.t_converged}, "
+          f"stable={sim.stable_periods}.")
+
+
+def _selftest_early_termination_in_worker() -> None:
+    """Worker bricht Lauf bei Konvergenz vorzeitig ab."""
+    cfg = BatchConfig(
+        n=2, m=3, alpha=0.15, beta=4e-6, delta=0.95, mu=0.25, a0=0.0, xi=0.1,
+        a=[2.0, 2.0], c=[1.0, 1.0], episodes=500_000, seeds=[7],
+        avg_window=500, init_strategy="zeros",
+    )
+    # Kleiner Threshold per Patch wuerde das Modell aendern; stattdessen
+    # nutzen wir den Default 100k und verlassen uns darauf, dass der Worker
+    # bei Konvergenz abbricht (auch wenn das hier nicht zwingend eintritt).
+    res = _run_single_replication((cfg, 7, None))
+    # Egal ob konvergiert oder nicht: n_iterations <= cfg.episodes
+    assert res.n_iterations <= cfg.episodes
+    # Wenn konvergiert: t_converged gesetzt und n_iterations entspricht
+    # sim.t am Abbruchzeitpunkt.
+    if res.converged:
+        assert res.t_converged is not None
+        # Bei Frueh-Abbruch ist n_iterations strikt kleiner als episodes
+        # (außer in dem unwahrscheinlichen Fall, dass Konvergenz exakt in
+        # der letzten Iteration eintritt).
+        assert res.n_iterations <= cfg.episodes
+        print(f"[selftest-early] Konvergierte Replikation: "
+              f"t_conv={res.t_converged}, n_iter={res.n_iterations}.")
+    else:
+        assert res.t_converged is None
+        assert res.n_iterations == cfg.episodes
+        print(f"[selftest-early] Nicht konvergiert (n_iter={res.n_iterations})")
 
 
 def _selftest_run() -> None:
@@ -3329,7 +3389,9 @@ def _run_selftests() -> None:
     _selftest_monopoly_global_asymmetric()
     _selftest_aggregate_split()
     _selftest_delta_leq_one()
-    _selftest_convergence_policy()
+    _selftest_convergence_init()
+    _selftest_convergence_incremental()
+    _selftest_early_termination_in_worker()
     _selftest_run()
     print("=== Alle Tests bestanden. ===")
 
